@@ -1,0 +1,87 @@
+name: Private APK analysis smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-apk-analysis
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    # Standard GitHub-hosted runner; this workflow is hosted in the public sample repository.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out public pipeline repository
+        uses: actions/checkout@v4
+
+      - name: Check out only the original APK from the private repository
+        uses: actions/checkout@v4
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: main
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify original file and analyze in temporary workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+
+          # Verify the checked-out bytes match the exact Git blob recorded in the private repo.
+          EXPECTED_BLOB="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL_BLOB="$(git hash-object "$APK")"
+          test "$EXPECTED_BLOB" = "$ACTUAL_BLOB"
+
+          mkdir -p "$RUNNER_TEMP/private-apk-tools"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$RUNNER_TEMP/private-apk-tools/apktool-release.json"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$RUNNER_TEMP/private-apk-tools/apktool-release.json" | head -n1)"
+          test -n "$APKTOOL_URL"
+          curl -fsSL "$APKTOOL_URL" -o "$RUNNER_TEMP/private-apk-tools/apktool.jar"
+
+          curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$RUNNER_TEMP/private-apk-tools/jadx-release.json"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\\.zip$")) | .browser_download_url' "$RUNNER_TEMP/private-apk-tools/jadx-release.json" | head -n1)"
+          test -n "$JADX_URL"
+          curl -fsSL "$JADX_URL" -o "$RUNNER_TEMP/private-apk-tools/jadx.zip"
+          mkdir -p "$RUNNER_TEMP/private-apk-tools/jadx"
+          unzip -q "$RUNNER_TEMP/private-apk-tools/jadx.zip" -d "$RUNNER_TEMP/private-apk-tools/jadx"
+          JADX_BIN="$(find "$RUNNER_TEMP/private-apk-tools/jadx" -type f -path '*/bin/jadx' | head -n1)"
+          test -n "$JADX_BIN"
+          chmod +x "$JADX_BIN"
+
+          # Keep all APK-derived output in the ephemeral runner workspace; never publish it.
+          java -jar "$RUNNER_TEMP/private-apk-tools/apktool.jar" d -f "$APK" -o "$RUNNER_TEMP/private-apk-tools/decoded" > "$RUNNER_TEMP/private-apk-tools/apktool.log" 2>&1
+          test -s "$RUNNER_TEMP/private-apk-tools/decoded/AndroidManifest.xml"
+
+          "$JADX_BIN" --output-dir "$RUNNER_TEMP/private-apk-tools/jadx-out" "$APK" > "$RUNNER_TEMP/private-apk-tools/jadx.log" 2>&1
+          test -d "$RUNNER_TEMP/private-apk-tools/jadx-out"
+          test -n "$(find "$RUNNER_TEMP/private-apk-tools/jadx-out" -type f -print -quit)"
+
+          {
+            echo "## Private APK smoke test"
+            echo
+            echo "- Original APK fetched from the private repository using read-only access."
+            echo "- Git blob integrity check: PASS."
+            echo "- Apktool decode: PASS."
+            echo "- JADX decompile: PASS."
+            echo "- APK-derived files, logs, and source were not committed or uploaded as artifacts."
+            echo "- This run validates analysis access and tooling only; no APK modifications were made."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary private source and analysis files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-apk-tools"
