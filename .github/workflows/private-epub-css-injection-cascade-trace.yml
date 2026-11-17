@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WORK="$RUNNER_TEMP/private-epub-css-resolution-trace"
+          WORK="$RUNNER_TEMP/private-epub-css-injection-cascade-trace"
           mkdir -p "$WORK"
           curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/apktool-release.json"
           APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          WORK="$RUNNER_TEMP/private-epub-css-resolution-trace"
+          WORK="$RUNNER_TEMP/private-epub-css-injection-cascade-trace"
           java -jar "$APKTOOL_JAR" d -f "_private-source/AlReaderX E-Ink-1.33.apk" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
           test -s "$WORK/decoded/AndroidManifest.xml"
           set +e
@@ -98,7 +98,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WORK="$RUNNER_TEMP/private-epub-css-resolution-trace"
+          WORK="$RUNNER_TEMP/private-epub-css-injection-cascade-trace"
           REPORT="_private-source/reports/private-epub-traces/css-injection-cascade-${GITHUB_RUN_ID}.md"
           mkdir -p "$(dirname "$REPORT")"
           python3 - "$WORK/jadx-out" "$REPORT" <<'PY'
@@ -175,7 +175,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add --sparse "reports/private-epub-traces/css-resolution-${GITHUB_RUN_ID}.md"
+          git add --sparse "reports/private-epub-traces/css-injection-cascade-${GITHUB_RUN_ID}.md"
           git commit -m "Add private EPUB CSS injection and cascade trace"
           git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$BRANCH"
           echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
@@ -199,4 +199,4 @@ jobs:
         shell: bash
         run: |
           rm -rf _private-source
-          rm -rf "$RUNNER_TEMP/private-epub-css-resolution-trace"
+          rm -rf "$RUNNER_TEMP/private-epub-css-injection-cascade-trace"
