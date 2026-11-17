@@ -135,7 +135,12 @@ jobs:
             echo "- Original APK fetched from the private repository using read-only access."
             echo "- Git blob integrity check: PASS."
             echo "- Apktool decode: PASS."
-            echo "- JADX decompile: PASS."
+            if [[ "${JADX_RESULT:-FAIL}" == "PASS" ]]; then
+              echo "- JADX decompile: PASS."
+            else
+              echo "- JADX decompile: PARTIAL (exit code 3; reported errors: ${JADX_ERRORS:-unknown}). Output files were generated, but some classes need manual review."
+            fi
+            echo "- JADX result is not represented as a full PASS when decompilation errors occur."
             echo "- APK-derived files, logs, and source were not committed or uploaded as artifacts."
             echo "- No APK modifications were made."
           } >> "$GITHUB_STEP_SUMMARY"
