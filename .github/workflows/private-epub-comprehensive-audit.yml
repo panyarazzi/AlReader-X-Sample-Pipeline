@@ -24,7 +24,7 @@ jobs:
         with:
           repository: panyarazzi/AlReader-X-APK-Transfer
           ref: main
-          token: \${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
           path: _private-source
           sparse-checkout: |
             AlReaderX E-Ink-1.33.apk
@@ -85,7 +85,7 @@ jobs:
           if [ "$RC" -eq 0 ]; then RESULT=PASS; elif [ "$RC" -eq 3 ]; then RESULT=PARTIAL; else echo "Unexpected JADX exit code: $RC"; exit "$RC"; fi
           echo "JADX_RESULT=$RESULT" >> "$GITHUB_ENV"
           echo "JADX_FILES=$FILES" >> "$GITHUB_ENV"
-          echo "JADX_ERRORS=\${ERRORS:-unknown}" >> "$GITHUB_ENV"
+          echo "JADX_ERRORS=${ERRORS:-unknown}" >> "$GITHUB_ENV"
       - name: Generate consolidated private evidence report
         shell: bash
         run: |
@@ -185,7 +185,7 @@ jobs:
       - name: Commit detailed report to private analysis branch
         shell: bash
         env:
-          PRIVATE_REPORT_WRITE_TOKEN: \${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+          PRIVATE_REPORT_WRITE_TOKEN: ${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
         run: |
           set -euo pipefail
           cd _private-source
@@ -208,8 +208,8 @@ jobs:
             echo "- One APK decode and one JADX pass were used."
             echo "- Detailed evidence remains in a private branch."
             echo "- No APK, decompiled tree, source excerpts, private paths or resource contents are published."
-            echo "- Private report branch: \${PRIVATE_REPORT_BRANCH:-not created}."
-            echo "- JADX: \${JADX_RESULT:-not completed}; files: \${JADX_FILES:-unknown}; errors: \${JADX_ERRORS:-unknown}."
+            echo "- Private report branch: ${PRIVATE_REPORT_BRANCH:-not created}."
+            echo "- JADX: ${JADX_RESULT:-not completed}; files: ${JADX_FILES:-unknown}; errors: ${JADX_ERRORS:-unknown}."
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Cleanup private source and analysis output
         if: always()
