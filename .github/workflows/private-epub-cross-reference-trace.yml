@@ -56,11 +56,11 @@ jobs:
           WORK="$RUNNER_TEMP/private-epub-trace"
           mkdir -p "$WORK"
           curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/apktool-release.json"
-          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\.jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
           [[ "$APKTOOL_URL" =~ ^https://github\.com/ ]]
           curl -fsSL "$APKTOOL_URL" -o "$WORK/apktool.jar"
           curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$WORK/jadx-release.json"
-          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\\.zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\.zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
           [[ "$JADX_URL" =~ ^https://github\.com/ ]]
           curl -fsSL "$JADX_URL" -o "$WORK/jadx.zip"
           mkdir -p "$WORK/jadx"
@@ -108,11 +108,11 @@ jobs:
           src, decoded, report = sys.argv[1:]
           extensions = ('.java', '.kt', '.smali', '.xml')
           groups = {
-            'EPUB/container': [r'epub', r'application/epub\\+zip', r'ZipFile', r'ZipInputStream', r'container\\.xml', r'OPF'],
-            'HTML/DOM': [r'org\\.jsoup', r'Html\\.fromHtml', r'DocumentBuilder', r'loadDataWithBaseURL', r'text/html', r'WebResourceResponse'],
-            'WebView/bridge': [r'android\\.webkit\\.WebView', r'WebViewClient', r'WebChromeClient', r'addJavascriptInterface', r'evaluateJavascript'],
-            'CSS': [r'text/css', r'\\.css', r'insertCSS', r'CSSStyleSheet', r'cssText', r'addStyleSheet'],
-            'Fonts': [r'Typeface', r'AssetManager', r'\\.ttf', r'\\.otf', r'\\.woff', r'FontFamily', r'font-family'],
+            'EPUB/container': [r'epub', r'application/epub\+zip', r'ZipFile', r'ZipInputStream', r'container\.xml', r'OPF'],
+            'HTML/DOM': [r'org\.jsoup', r'Html\.fromHtml', r'DocumentBuilder', r'loadDataWithBaseURL', r'text/html', r'WebResourceResponse'],
+            'WebView/bridge': [r'android\.webkit\.WebView', r'WebViewClient', r'WebChromeClient', r'addJavascriptInterface', r'evaluateJavascript'],
+            'CSS': [r'text/css', r'\.css', r'insertCSS', r'CSSStyleSheet', r'cssText', r'addStyleSheet'],
+            'Fonts': [r'Typeface', r'AssetManager', r'\.ttf', r'\.otf', r'\.woff', r'FontFamily', r'font-family'],
             'Pagination': [r'pageBreak', r'page-break', r'pagination', r'paginate', r'getPageCount', r'currentPage'],
             'Typography/style': [r'font-family', r'font-size', r'line-height', r'text-indent', r'font-weight', r'font-style', r'text-align'],
           }
@@ -141,25 +141,25 @@ jobs:
                 if a in hits and b in hits: pair_hits[(a,b)] += 1
           decoded_count = sum(len(ns) for _,_,ns in os.walk(decoded))
           with open(report,'w',encoding='utf-8') as out:
-            out.write('# Private EPUB rendering cross-reference index\\n\\n')
-            out.write('This report is private. It contains file paths, line numbers and extracted identifiers only; no source-code excerpts or APK bytes.\\n\\n')
-            out.write(f'- Original APK integrity: PASS (verified before analysis)\\n- JADX: {os.environ.get("JADX_RESULT")} ({os.environ.get("JADX_FILES")} generated files; {os.environ.get("JADX_ERRORS")} reported errors)\\n- Decompiled source/XML files scanned: {scanned}\\n- Decoded files: {decoded_count}\\n\\n')
-            out.write('## Indicator file counts\\n\\n')
-            for group in groups: out.write(f'- {group}: {len(set(x[0] for x in file_hits[group]))} files; {len(file_hits[group])} matching lines\\n')
-            out.write('\\n## Same-file cross-reference counts\\n\\n')
-            for (a,b),count in pair_hits.items(): out.write(f'- {a} + {b}: {count} files\\n')
+            out.write('# Private EPUB rendering cross-reference index\n\n')
+            out.write('This report is private. It contains file paths, line numbers and extracted identifiers only; no source-code excerpts or APK bytes.\n\n')
+            out.write(f'- Original APK integrity: PASS (verified before analysis)\n- JADX: {os.environ.get("JADX_RESULT")} ({os.environ.get("JADX_FILES")} generated files; {os.environ.get("JADX_ERRORS")} reported errors)\n- Decompiled source/XML files scanned: {scanned}\n- Decoded files: {decoded_count}\n\n')
+            out.write('## Indicator file counts\n\n')
+            for group in groups: out.write(f'- {group}: {len(set(x[0] for x in file_hits[group]))} files; {len(file_hits[group])} matching lines\n')
+            out.write('\n## Same-file cross-reference counts\n\n')
+            for (a,b),count in pair_hits.items(): out.write(f'- {a} + {b}: {count} files\n')
             for group in groups:
-              out.write(f'\\n## {group}: candidate files and symbol locations\\n\\n')
+              out.write(f'\n## {group}: candidate files and symbol locations\n\n')
               seen=set()
               for path,line,ids in file_hits[group]:
                 key=(path,line)
                 if key in seen: continue
                 seen.add(key)
-                out.write(f'- `{path}:{line}`' + (f' — `{ids}`' if ids else '') + '\\n')
-            out.write('\\n## Interpretation limits\\n\\n')
-            out.write('- Co-occurrence and symbol references are static clues, not proof of runtime execution or call order.\\n')
-            out.write('- JADX output is partial; missing symbols or references are not proof that a feature is absent.\\n')
-            out.write('- Use this index to select exact candidates for a second, narrower call-chain review. Do not modify the APK based on this index alone.\\n')
+                out.write(f'- `{path}:{line}`' + (f' — `{ids}`' if ids else '') + '\n')
+            out.write('\n## Interpretation limits\n\n')
+            out.write('- Co-occurrence and symbol references are static clues, not proof of runtime execution or call order.\n')
+            out.write('- JADX output is partial; missing symbols or references are not proof that a feature is absent.\n')
+            out.write('- Use this index to select exact candidates for a second, narrower call-chain review. Do not modify the APK based on this index alone.\n')
           PY
           echo "Private trace index created; source excerpts were not collected."
 
