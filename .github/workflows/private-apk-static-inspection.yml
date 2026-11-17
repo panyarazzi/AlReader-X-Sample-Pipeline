@@ -146,16 +146,16 @@ jobs:
                       count += 1
               hits[label] = count
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as out:
-              out.write('## Private APK static inspection (aggregate-only)\\n\\n')
-              out.write('- Original APK Git blob integrity: **PASS**.\\n')
-              out.write(f'- Minimum SDK declared: **{min_sdk_value}**; target SDK declared: **{target_sdk_value}**.\\n')
-              out.write(f'- DEX files: **{dex_count}**; manifest permissions: **{permissions}**; application components: **{components}**.\\n')
-              out.write(f'- APK resource entries: **{resource_entries}**; asset entries: **{asset_entries}**.\\n')
-              out.write(f'- JADX result: **{os.environ.get("JADX_RESULT","UNKNOWN")}**; generated files: **{os.environ.get("JADX_FILES","0")}**; reported errors: **{os.environ.get("JADX_ERRORS","unknown")}**.\\n\\n')
-              out.write('### Decompiled-source indicator counts\\n\\n')
+              out.write('## Private APK static inspection (aggregate-only)\n\n')
+              out.write('- Original APK Git blob integrity: **PASS**.\n')
+              out.write(f'- Minimum SDK declared: **{min_sdk_value}**; target SDK declared: **{target_sdk_value}**.\n')
+              out.write(f'- DEX files: **{dex_count}**; manifest permissions: **{permissions}**; application components: **{components}**.\n')
+              out.write(f'- APK resource entries: **{resource_entries}**; asset entries: **{asset_entries}**.\n')
+              out.write(f'- JADX result: **{os.environ.get("JADX_RESULT","UNKNOWN")}**; generated files: **{os.environ.get("JADX_FILES","0")}**; reported errors: **{os.environ.get("JADX_ERRORS","unknown")}**.\n\n')
+              out.write('### Decompiled-source indicator counts\n\n')
               for label, count in hits.items():
-                  out.write(f'- {label}: **{count} files with at least one indicator**.\\n')
-              out.write('\\nCounts are search indicators, not proof that a feature is active or that a specific rendering path is used. No class names, source excerpts, strings, resources, APK bytes, or decompiled files are published.\\n')
+                  out.write(f'- {label}: **{count} files with at least one indicator**.\n')
+              out.write('\nCounts are search indicators, not proof that a feature is active or that a specific rendering path is used. No class names, source excerpts, strings, resources, APK bytes, or decompiled files are published.\n')
           PY
 
       - name: Remove temporary private source and analysis files
