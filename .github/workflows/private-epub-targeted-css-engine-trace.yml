@@ -1,0 +1,203 @@
+name: Private EPUB targeted CSS engine trace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-epub-targeted-css-engine-trace
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated public pipeline
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Checkout original APK privately
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: analysis/epub-css-cascade-44107513195
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify original APK integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK integrity: PASS"
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Download Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-targeted"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/release.json"
+          URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/release.json" | head -n1)"
+          [[ "$URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$URL" -o "$WORK/apktool.jar"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+      - name: Decode APK privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-targeted"
+          java -jar "$APKTOOL_JAR" d -f "_private-source/AlReaderX E-Ink-1.33.apk" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          echo "Smali decode: PASS"
+      - name: Trace exact CSS engine and EPUB call paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-targeted"
+          REPORT="_private-source/reports/private-epub-traces/targeted-css-engine-$GITHUB_RUN_ID.md"
+          mkdir -p "$(dirname "$REPORT")"
+          python3 - "$WORK/decoded" "$REPORT" <<'PY'
+          import os,sys,re
+          root,report=sys.argv[1:3]
+          files={}
+          for base,_,names in os.walk(root):
+              for name in names:
+                  if name.endswith(".smali"):
+                      p=os.path.join(base,name)
+                      rel=os.path.relpath(p,root).replace(os.sep,"/")
+                      try:
+                          with open(p,encoding="utf-8",errors="replace") as f: files[rel]=f.readlines()
+                      except OSError: pass
+          headers={}
+          for path,lines in files.items():
+              cls=next((m.group(1) for x in lines if (m:=re.search(r"^\.class\s+.*?(L[^;]+;)",x))),None)
+              sup=next((m.group(1) for x in lines if (m:=re.search(r"^\.super\s+(L[^;]+;)",x))),None)
+              if cls: headers[cls]=(path,sup)
+          def methods(lines):
+              i=0
+              while i<len(lines):
+                  if lines[i].startswith(".method "):
+                      s=i
+                      while i<len(lines) and not lines[i].startswith(".end method"): i+=1
+                      yield s,min(i+1,len(lines)),"".join(lines[s:min(i+1,len(lines))])
+                  i+=1
+          def name(body):
+              m=re.search(r"^\.method\s+.*?\s([^ (]+)",body.splitlines()[0])
+              return m.group(1) if m else ""
+          def emit_class(out,desc,selected=None,all_methods=False):
+              if desc not in headers:
+                  out.write("Class unresolved in decoded output: "+desc+"\n\n"); return
+              path,sup=headers[desc]
+              out.write("### "+desc+"\n\n- File: "+path+"\n- Superclass: "+str(sup)+"\n\n")
+              count=0
+              for s,e,body in methods(files[path]):
+                  nm=name(body)
+                  if not all_methods and selected is not None and nm not in selected: continue
+                  out.write("#### Lines %d-%d — %s\n\n\`\`\`smali\n%s\`\`\`\n\n"%(s+1,e,body.splitlines()[0].strip(),body))
+                  count+=1
+              if not count: out.write("No selected method body found. This is not proof of absence if decode is partial.\n\n")
+          def emit_matching_methods(out,pattern):
+              count=0
+              for path,lines in sorted(files.items()):
+                  for s,e,body in methods(lines):
+                      if re.search(pattern,body.splitlines()[0],re.I):
+                          out.write("### "+path+" lines "+str(s+1)+"-"+str(e)+"\n\n\`\`\`smali\n"+body+"\`\`\`\n\n")
+                          count+=1
+              if not count: out.write("No matching method definitions found.\n\n")
+          def emit_callsite_context(out,pattern):
+              count=0
+              for path,lines in sorted(files.items()):
+                  for s,e,body in methods(lines):
+                      if re.search(pattern,body):
+                          out.write("### "+path+" — "+body.splitlines()[0].strip()+"\n\n\`\`\`smali\n"+body+"\`\`\`\n\n")
+                          count+=1
+              if not count: out.write("No matching callsite methods found.\n\n")
+          targets={
+           "Lcom/neverland/engbook/allstyles/AlCSSHtml;":None,
+           "Lcom/neverland/engbook/allstyles/AlCSSStyles;":{"apply1OneClassX","parseTemp","parseFile"},
+           "Lcom/neverland/engbook/allstyles/AlSetCSS;":{"applyValue","applyValue0","acceptValue","apply_WEIGHT_1","apply_WEIGHT_2","apply_WEIGHT_10","apply_WEIGHT_11","apply_WEIGHT_12","apply_WEIGHT_20","apply_WEIGHT_21","apply_WEIGHT_22"},
+           "Lcom/neverland/engbook/allstyles/AlOneCSSPair;":{"mixFrom"},
+           "Lcom/neverland/engbook/allstyles/AlStyleStack;":None,
+           "Lcom/neverland/engbook/formats/AlFormatEPUB;":None,
+           "Lcom/neverland/engbook/formats/AlFormatBaseHTML;":None,
+           "Lcom/neverland/engbook/formats/AlAXML;":None,
+           "Lcom/neverland/engbook/book/TBookCSS;":{"getCSSString","setRealStyleCSS"},
+           "Lcom/neverland/engbook/book/TBook;":{"updateRealCSS"},
+           "Lcom/neverland/engbook/AlBookEng;":{"setRealCSS"},
+          }
+          with open(report,"w",encoding="utf-8") as out:
+              out.write("# Private EPUB targeted CSS engine trace\n\n")
+              out.write("- Decoded Smali files: %d\n- Original APK blob integrity verified before decoding.\n- Static inspection only; no APK modifications.\n- Class descriptors are resolved from decoded DEX; package mismatches are explicitly reported.\n\n"%len(files))
+              out.write("## 1. Exact class declarations, superclass and targeted method bodies\n\n")
+              for desc,selected in targets.items(): emit_class(out,desc,selected,all_methods=(selected is None))
+              out.write("## 2. All apply_WEIGHT_* definitions (method bodies)\n\n")
+              emit_matching_methods(out,r"apply_WEIGHT_[0-9]+")
+              out.write("## 3. Declaration parsing and priority handling in CSS parser classes\n\n")
+              for desc,(path,sup) in headers.items():
+                  if re.search(r"AlCSSHtml|AlCSSStyles|AlSetCSS|AlOneCSSPair",desc):
+                      emit_class(out,desc,selected=None,all_methods=True)
+              out.write("## 4. Exact stylesheet/import and Work Set call paths\n\n")
+              emit_callsite_context(out,r"parseFile|@import|currentSet|allSets|text/css|Ljava/lang/String;.*CSS")
+              out.write("## 5. Exact EPUB inline-style parseTemp call paths\n\n")
+              emit_callsite_context(out,r"parseTemp|Lcom/neverland/engbook/allstyles/AlCSSStyles;->parseTemp")
+              out.write("## 6. EPUB font-face and font resource path candidates\n\n")
+              emit_callsite_context(out,r"font-family|font-weight|font-style|font-size|@font-face|\.ttf|\.otf|\.woff|\.woff2|Typeface;->create|Typeface;->createFrom")
+              out.write("## 7. TBookCSS / TBook / AlBookEng callsites\n\n")
+              emit_callsite_context(out,r"getCSSString|setRealStyleCSS|updateRealCSS|setRealCSS")
+              out.write("## 8. Interpretation limits\n\n")
+              out.write("- Smali callsites establish reachable code paths, not runtime execution for every EPUB.\n")
+              out.write("- Font CSS parsing, archive-resource resolution and Typeface use must be connected by matching registers/arguments before claiming embedded font support.\n")
+              out.write("- !important is only confirmed if parser state and downstream masks/priority comparisons are traced; string presence alone is insufficient.\n")
+              out.write("- Selector-weight names are not equated to CSS specificity without constants and dispatch semantics.\n")
+              out.write("- No matches in a partial decode are not proof of absence.\n")
+          print("Targeted private CSS engine report created.")
+          PY
+      - name: Commit detailed report to private branch
+        shell: bash
+        env:
+          PRIVATE_REPORT_WRITE_TOKEN: ${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd _private-source
+          BRANCH="analysis/epub-targeted-css-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add --sparse "reports/private-epub-traces/targeted-css-engine-$GITHUB_RUN_ID.md"
+          git commit -m "Add private EPUB targeted CSS engine trace"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$BRANCH"
+          echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+      - name: Publish sanitized public summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Private EPUB targeted CSS engine trace"
+            echo
+            echo "- Original APK integrity checked before private decoding."
+            echo "- Detailed Smali method bodies are stored only in the private repository."
+            echo "- No APK, decompiled source, private class/method excerpts or private paths are published."
+            echo "- Private report branch: ${PRIVATE_REPORT_BRANCH:-not created}."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-epub-targeted"
