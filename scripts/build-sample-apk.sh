@@ -32,8 +32,8 @@ sdkInfo:
   minSdkVersion: '21'
   targetSdkVersion: '28'
 versionInfo:
-  versionCode: '1'
-  versionName: '1.0'
+  versionCode: 1
+  versionName: 1.0
 doNotCompress:
 - resources.arsc
 YAML
