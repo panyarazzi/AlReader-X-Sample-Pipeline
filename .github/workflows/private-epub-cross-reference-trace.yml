@@ -56,11 +56,11 @@ jobs:
           WORK="$RUNNER_TEMP/private-epub-trace"
           mkdir -p "$WORK"
           curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/apktool-release.json"
-          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\.jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
           [[ "$APKTOOL_URL" =~ ^https://github\.com/ ]]
           curl -fsSL "$APKTOOL_URL" -o "$WORK/apktool.jar"
           curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$WORK/jadx-release.json"
-          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\.zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+[.]zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
           [[ "$JADX_URL" =~ ^https://github\.com/ ]]
           curl -fsSL "$JADX_URL" -o "$WORK/jadx.zip"
           mkdir -p "$WORK/jadx"
