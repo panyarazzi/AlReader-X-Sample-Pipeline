@@ -1,0 +1,202 @@
+name: Private EPUB cross-reference trace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-epub-cross-reference-trace
+  cancel-in-progress: false
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out public pipeline repository
+        uses: actions/checkout@v5
+
+      - name: Check out private source and report destination
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: main
+          token: ${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+            reports/private-epub-traces
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Verify original APK integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK integrity: PASS"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download analysis tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-trace"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/apktool-release.json"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
+          [[ "$APKTOOL_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$APKTOOL_URL" -o "$WORK/apktool.jar"
+          curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$WORK/jadx-release.json"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\\.zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
+          [[ "$JADX_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$JADX_URL" -o "$WORK/jadx.zip"
+          mkdir -p "$WORK/jadx"
+          unzip -q "$WORK/jadx.zip" -d "$WORK/jadx"
+          JADX_BIN="$(find "$WORK/jadx" -type f -path '*/bin/jadx' | head -n1)"
+          test -n "$JADX_BIN"
+          chmod +x "$JADX_BIN"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+
+      - name: Decode and partially decompile
+        shell: bash
+        run: |
+          set -uo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          WORK="$RUNNER_TEMP/private-epub-trace"
+          java -jar "$APKTOOL_JAR" d -f "$APK" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          set +e
+          "$JADX_BIN" --show-bad-code --output-dir "$WORK/jadx-out" "$APK" > "$WORK/jadx.log" 2>&1
+          JADX_EXIT=$?
+          set -e
+          FILE_COUNT="$(find "$WORK/jadx-out" -type f 2>/dev/null | wc -l | tr -d ' ')"
+          ERROR_COUNT="$(grep -E 'finished with errors, count:' "$WORK/jadx.log" | tail -n1 | sed 's/.*count: //' || true)"
+          if [[ "$FILE_COUNT" -eq 0 ]]; then
+            echo "JADX generated no source output"
+            exit 1
+          fi
+          if [[ "$JADX_EXIT" -eq 0 ]]; then RESULT=PASS
+          elif [[ "$JADX_EXIT" -eq 3 ]]; then RESULT=PARTIAL
+          else echo "JADX failed with unexpected exit code $JADX_EXIT"; exit "$JADX_EXIT"; fi
+          echo "JADX_RESULT=$RESULT" >> "$GITHUB_ENV"
+          echo "JADX_FILES=$FILE_COUNT" >> "$GITHUB_ENV"
+          echo "JADX_ERRORS=${ERROR_COUNT:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Build private symbol and cross-reference index
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-trace"
+          REPORT="_private-source/reports/private-epub-traces/trace-${GITHUB_RUN_ID}.md"
+          mkdir -p "$(dirname "$REPORT")"
+          python3 - "$WORK/jadx-out" "$WORK/decoded" "$REPORT" <<'PY'
+          import os, sys, re, collections
+          src, decoded, report = sys.argv[1:]
+          extensions = ('.java', '.kt', '.smali', '.xml')
+          groups = {
+            'EPUB/container': [r'epub', r'application/epub\\+zip', r'ZipFile', r'ZipInputStream', r'container\\.xml', r'OPF'],
+            'HTML/DOM': [r'org\\.jsoup', r'Html\\.fromHtml', r'DocumentBuilder', r'loadDataWithBaseURL', r'text/html', r'WebResourceResponse'],
+            'WebView/bridge': [r'android\\.webkit\\.WebView', r'WebViewClient', r'WebChromeClient', r'addJavascriptInterface', r'evaluateJavascript'],
+            'CSS': [r'text/css', r'\\.css', r'insertCSS', r'CSSStyleSheet', r'cssText', r'addStyleSheet'],
+            'Fonts': [r'Typeface', r'AssetManager', r'\\.ttf', r'\\.otf', r'\\.woff', r'FontFamily', r'font-family'],
+            'Pagination': [r'pageBreak', r'page-break', r'pagination', r'paginate', r'getPageCount', r'currentPage'],
+            'Typography/style': [r'font-family', r'font-size', r'line-height', r'text-indent', r'font-weight', r'font-style', r'text-align'],
+          }
+          compiled = {k:[re.compile(p,re.I) for p in pats] for k,pats in groups.items()}
+          file_hits = collections.defaultdict(list)
+          pair_hits = collections.Counter()
+          scanned = 0
+          for base, _, names in os.walk(src):
+            for name in names:
+              if not name.endswith(extensions): continue
+              path = os.path.join(base,name)
+              try:
+                with open(path,encoding='utf-8',errors='ignore') as f: lines=f.readlines()
+              except OSError: continue
+              scanned += 1
+              hits = set()
+              for n,line in enumerate(lines,1):
+                for group, pats in compiled.items():
+                  if any(p.search(line) for p in pats):
+                    hits.add(group)
+                    # Record identifiers and line numbers only; never copy source lines.
+                    ids = re.findall(r'[A-Za-z_$][A-Za-z0-9_$]{2,}', line)
+                    ids = [x for x in ids if x.lower() not in {'public','private','protected','static','final','return','new','class','void','string','int','boolean','null','true','false','this','super','import','package'}]
+                    file_hits[group].append((os.path.relpath(path,src),n,','.join(dict.fromkeys(ids[:10]))))
+              for a,b in [('EPUB/container','HTML/DOM'),('HTML/DOM','WebView/bridge'),('WebView/bridge','CSS'),('CSS','Fonts'),('EPUB/container','Pagination'),('CSS','Typography/style'),('WebView/bridge','Fonts'),('EPUB/container','CSS'),('HTML/DOM','CSS'),('Fonts','Pagination')]:
+                if a in hits and b in hits: pair_hits[(a,b)] += 1
+          decoded_count = sum(len(ns) for _,_,ns in os.walk(decoded))
+          with open(report,'w',encoding='utf-8') as out:
+            out.write('# Private EPUB rendering cross-reference index\\n\\n')
+            out.write('This report is private. It contains file paths, line numbers and extracted identifiers only; no source-code excerpts or APK bytes.\\n\\n')
+            out.write(f'- Original APK integrity: PASS (verified before analysis)\\n- JADX: {os.environ.get("JADX_RESULT")} ({os.environ.get("JADX_FILES")} generated files; {os.environ.get("JADX_ERRORS")} reported errors)\\n- Decompiled source/XML files scanned: {scanned}\\n- Decoded files: {decoded_count}\\n\\n')
+            out.write('## Indicator file counts\\n\\n')
+            for group in groups: out.write(f'- {group}: {len(set(x[0] for x in file_hits[group]))} files; {len(file_hits[group])} matching lines\\n')
+            out.write('\\n## Same-file cross-reference counts\\n\\n')
+            for (a,b),count in pair_hits.items(): out.write(f'- {a} + {b}: {count} files\\n')
+            for group in groups:
+              out.write(f'\\n## {group}: candidate files and symbol locations\\n\\n')
+              seen=set()
+              for path,line,ids in file_hits[group]:
+                key=(path,line)
+                if key in seen: continue
+                seen.add(key)
+                out.write(f'- `{path}:{line}`' + (f' — `{ids}`' if ids else '') + '\\n')
+            out.write('\\n## Interpretation limits\\n\\n')
+            out.write('- Co-occurrence and symbol references are static clues, not proof of runtime execution or call order.\\n')
+            out.write('- JADX output is partial; missing symbols or references are not proof that a feature is absent.\\n')
+            out.write('- Use this index to select exact candidates for a second, narrower call-chain review. Do not modify the APK based on this index alone.\\n')
+          PY
+          echo "Private trace index created; source excerpts were not collected."
+
+      - name: Commit report to a new private branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd _private-source
+          BRANCH="analysis/epub-trace-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add reports/private-epub-traces/trace-${GITHUB_RUN_ID}.md
+          git commit -m "Add private EPUB rendering cross-reference index"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          echo "Private report branch created."
+
+      - name: Publish sanitized workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Private EPUB cross-reference trace"
+            echo
+            echo "- Original APK is checked out privately and verified by Git blob SHA."
+            echo "- Decompiled source and symbol index are stored only in a new branch of the private source repository."
+            echo "- No APK, source excerpts, class names, method names, or detailed paths are published in this public workflow summary."
+            echo "- JADX result: ${JADX_RESULT:-not completed}; generated files: ${JADX_FILES:-unknown}; errors: ${JADX_ERRORS:-unknown}."
+            echo "- Report branch: ${PRIVATE_REPORT_BRANCH:-not created}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove private source, credentials and temporary analysis files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-epub-trace"
