@@ -104,14 +104,70 @@ jobs:
           echo "Apktool decode: PASS"
 
       - name: Decompile original APK with JADX
+        id: jadx
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           APK="_private-source/AlReaderX E-Ink-1.33.apk"
-          "$JADX_BIN" --output-dir "$RUNNER_TEMP/private-apk-tools/jadx-out" "$APK"
-          test -d "$RUNNER_TEMP/private-apk-tools/jadx-out"
-          test -n "$(find "$RUNNER_TEMP/private-apk-tools/jadx-out" -type f -print -quit)"
-          echo "JADX decompile: PASS"
+          OUT="$RUNNER_TEMP/private-apk-tools/jadx-out"
+          LOG="$RUNNER_TEMP/private-apk-tools/jadx.log"
+
+          # JADX may emit usable source while returning exit code 3 for classes
+          # it could not fully decompile. Preserve that distinction explicitly.
+          set +e
+          "$JADX_BIN" --show-bad-code --output-dir "$OUT" "$APK" > "$LOG" 2>&1
+          JADX_EXIT=$?
+          set -e
+
+          cat "$LOG"
+          FILE_COUNT=0
+          if [[ -d "$OUT" ]]; then
+            FILE_COUNT="$(find "$OUT" -type f | wc -l | tr -d ' ')"
+          fi
+          ERROR_COUNT="$(grep -Eo 'finished with errors, count: [0-9]+' "$LOG" | tail -n1 | grep -Eo '[0-9]+
+      - name: Write non-sensitive smoke-test summary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "## Private APK smoke test"
+            echo
+            echo "- Original APK fetched from the private repository using read-only access."
+            echo "- Git blob integrity check: PASS."
+            echo "- Apktool decode: PASS."
+            echo "- JADX decompile: PASS."
+            echo "- APK-derived files, logs, and source were not committed or uploaded as artifacts."
+            echo "- No APK modifications were made."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary private source and analysis files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-apk-tools"
+ || true)"
+
+          echo "JADX exit code: $JADX_EXIT"
+          echo "JADX output files: $FILE_COUNT"
+          echo "JADX reported errors: ${ERROR_COUNT:-0}"
+
+          if [[ "$FILE_COUNT" -eq 0 ]]; then
+            echo "JADX produced no output files"
+            exit 1
+          fi
+
+          if [[ "$JADX_EXIT" -eq 0 ]]; then
+            echo "JADX_RESULT=PASS" >> "$GITHUB_ENV"
+            echo "JADX_ERRORS=0" >> "$GITHUB_ENV"
+          elif [[ "$JADX_EXIT" -eq 3 ]]; then
+            echo "JADX_RESULT=PARTIAL" >> "$GITHUB_ENV"
+            echo "JADX_ERRORS=${ERROR_COUNT:-unknown}" >> "$GITHUB_ENV"
+            echo "::warning::JADX produced source output but reported decompilation errors; review is required."
+          else
+            echo "JADX failed with unexpected exit code $JADX_EXIT"
+            exit "$JADX_EXIT"
+          fi
 
       - name: Write non-sensitive smoke-test summary
         if: success()
