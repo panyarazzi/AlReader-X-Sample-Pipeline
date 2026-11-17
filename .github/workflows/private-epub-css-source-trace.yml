@@ -168,7 +168,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add "reports/private-epub-traces/css-source-${GITHUB_RUN_ID}.md"
+          git add --sparse "reports/private-epub-traces/css-source-${GITHUB_RUN_ID}.md"
           git commit -m "Add private EPUB CSS source-context trace"
           git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$BRANCH"
           echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
