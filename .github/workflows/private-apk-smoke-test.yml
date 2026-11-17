@@ -12,7 +12,6 @@ concurrency:
 
 jobs:
   analyze:
-    # Standard GitHub-hosted Ubuntu runner; the workflow lives in the public sample repo.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -40,10 +39,8 @@ jobs:
           test -s "$APK"
           EXPECTED_BLOB="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
           ACTUAL_BLOB="$(git hash-object "$APK")"
-          echo "Private APK checkout: present"
-          echo "Expected Git blob: $EXPECTED_BLOB"
-          echo "Actual Git blob:   $ACTUAL_BLOB"
           test "$EXPECTED_BLOB" = "$ACTUAL_BLOB"
+          echo "Private APK checkout: present"
           echo "Git blob integrity: PASS"
 
       - name: Set up Java
@@ -52,35 +49,20 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Keep this download procedure identical to the already-passing public fixture workflow.
-      # These are public release assets; no GitHub token is needed.
       - name: Download Apktool and JADX
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/private-apk-tools"
-
-          echo "Fetching Apktool release metadata"
           curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$RUNNER_TEMP/private-apk-tools/apktool-release.json"
           APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$RUNNER_TEMP/private-apk-tools/apktool-release.json" | head -n1)"
-          if [[ ! "$APKTOOL_URL" =~ ^https://github\.com/ ]]; then
-            echo "Apktool release asset URL missing or unexpected"
-            jq -r '.tag_name, (.assets[]?.name)' "$RUNNER_TEMP/private-apk-tools/apktool-release.json"
-            exit 1
-          fi
-          echo "Downloading Apktool release asset"
+          [[ "$APKTOOL_URL" =~ ^https://github\.com/ ]]
           curl -fsSL "$APKTOOL_URL" -o "$RUNNER_TEMP/private-apk-tools/apktool.jar"
           test -s "$RUNNER_TEMP/private-apk-tools/apktool.jar"
 
-          echo "Fetching JADX release metadata"
           curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$RUNNER_TEMP/private-apk-tools/jadx-release.json"
           JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\\.zip$")) | .browser_download_url' "$RUNNER_TEMP/private-apk-tools/jadx-release.json" | head -n1)"
-          if [[ ! "$JADX_URL" =~ ^https://github\.com/ ]]; then
-            echo "JADX release asset URL missing or unexpected"
-            jq -r '.tag_name, (.assets[]?.name)' "$RUNNER_TEMP/private-apk-tools/jadx-release.json"
-            exit 1
-          fi
-          echo "Downloading JADX release asset"
+          [[ "$JADX_URL" =~ ^https://github\.com/ ]]
           curl -fsSL "$JADX_URL" -o "$RUNNER_TEMP/private-apk-tools/jadx.zip"
           test -s "$RUNNER_TEMP/private-apk-tools/jadx.zip"
 
@@ -104,7 +86,6 @@ jobs:
           echo "Apktool decode: PASS"
 
       - name: Decompile original APK with JADX
-        id: jadx
         shell: bash
         run: |
           set -uo pipefail
@@ -112,47 +93,17 @@ jobs:
           OUT="$RUNNER_TEMP/private-apk-tools/jadx-out"
           LOG="$RUNNER_TEMP/private-apk-tools/jadx.log"
 
-          # JADX may emit usable source while returning exit code 3 for classes
-          # it could not fully decompile. Preserve that distinction explicitly.
           set +e
           "$JADX_BIN" --show-bad-code --output-dir "$OUT" "$APK" > "$LOG" 2>&1
           JADX_EXIT=$?
           set -e
-
           cat "$LOG"
+
           FILE_COUNT=0
           if [[ -d "$OUT" ]]; then
             FILE_COUNT="$(find "$OUT" -type f | wc -l | tr -d ' ')"
           fi
-          ERROR_COUNT="$(grep -Eo 'finished with errors, count: [0-9]+' "$LOG" | tail -n1 | grep -Eo '[0-9]+
-      - name: Write non-sensitive smoke-test summary
-        if: success()
-        shell: bash
-        run: |
-          {
-            echo "## Private APK smoke test"
-            echo
-            echo "- Original APK fetched from the private repository using read-only access."
-            echo "- Git blob integrity check: PASS."
-            echo "- Apktool decode: PASS."
-            if [[ "${JADX_RESULT:-FAIL}" == "PASS" ]]; then
-              echo "- JADX decompile: PASS."
-            else
-              echo "- JADX decompile: PARTIAL (exit code 3; reported errors: ${JADX_ERRORS:-unknown}). Output files were generated, but some classes need manual review."
-            fi
-            echo "- JADX result is not represented as a full PASS when decompilation errors occur."
-            echo "- APK-derived files, logs, and source were not committed or uploaded as artifacts."
-            echo "- No APK modifications were made."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Remove temporary private source and analysis files
-        if: always()
-        shell: bash
-        run: |
-          rm -rf _private-source
-          rm -rf "$RUNNER_TEMP/private-apk-tools"
- || true)"
-
+          ERROR_COUNT="$(grep -E 'finished with errors, count:' "$LOG" | tail -n1 | sed 's/.*count: //' || true)"
           echo "JADX exit code: $JADX_EXIT"
           echo "JADX output files: $FILE_COUNT"
           echo "JADX reported errors: ${ERROR_COUNT:-0}"
@@ -168,9 +119,9 @@ jobs:
           elif [[ "$JADX_EXIT" -eq 3 ]]; then
             echo "JADX_RESULT=PARTIAL" >> "$GITHUB_ENV"
             echo "JADX_ERRORS=${ERROR_COUNT:-unknown}" >> "$GITHUB_ENV"
-            echo "::warning::JADX produced source output but reported decompilation errors; review is required."
+            echo "::warning::JADX generated output but reported decompilation errors; manual review is required."
           else
-            echo "JADX failed with unexpected exit code $JADX_EXIT"
+            echo "Unexpected JADX exit code: $JADX_EXIT"
             exit "$JADX_EXIT"
           fi
 
@@ -184,7 +135,12 @@ jobs:
             echo "- Original APK fetched from the private repository using read-only access."
             echo "- Git blob integrity check: PASS."
             echo "- Apktool decode: PASS."
-            echo "- JADX decompile: PASS."
+            if [[ "${JADX_RESULT:-FAIL}" == "PASS" ]]; then
+              echo "- JADX decompile: PASS."
+            else
+              echo "- JADX decompile: PARTIAL; reported errors: ${JADX_ERRORS:-unknown}. Output files exist, but some classes require review."
+            fi
+            echo "- JADX partial results are not described as a full PASS."
             echo "- APK-derived files, logs, and source were not committed or uploaded as artifacts."
             echo "- No APK modifications were made."
           } >> "$GITHUB_STEP_SUMMARY"
