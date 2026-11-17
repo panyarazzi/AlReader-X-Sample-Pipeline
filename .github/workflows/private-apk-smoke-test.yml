@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   analyze:
-    # Standard GitHub-hosted runner; this workflow is hosted in the public sample repository.
+    # Standard GitHub-hosted Ubuntu runner; the workflow lives in the public sample repo.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -32,44 +32,91 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Verify original file and analyze in temporary workspace
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Verify original APK and Git blob integrity
         shell: bash
         run: |
           set -euo pipefail
           APK="_private-source/AlReaderX E-Ink-1.33.apk"
           test -s "$APK"
-
-          # Verify the checked-out bytes match the exact Git blob recorded in the private repo.
           EXPECTED_BLOB="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
           ACTUAL_BLOB="$(git hash-object "$APK")"
+          echo "Private APK checkout: present"
+          echo "Expected Git blob: $EXPECTED_BLOB"
+          echo "Actual Git blob:   $ACTUAL_BLOB"
           test "$EXPECTED_BLOB" = "$ACTUAL_BLOB"
+          echo "Git blob integrity: PASS"
 
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Keep this download procedure identical to the already-passing public fixture workflow.
+      # These are public release assets; no GitHub token is needed.
+      - name: Download Apktool and JADX
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/private-apk-tools"
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$RUNNER_TEMP/private-apk-tools/apktool-release.json"
-          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$RUNNER_TEMP/private-apk-tools/apktool-release.json" | head -n1)"
-          test -n "$APKTOOL_URL"
-          curl -fsSL "$APKTOOL_URL" -o "$RUNNER_TEMP/private-apk-tools/apktool.jar"
 
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/skylot/jadx/releases/latest -o "$RUNNER_TEMP/private-apk-tools/jadx-release.json"
+          echo "Fetching Apktool release metadata"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$RUNNER_TEMP/private-apk-tools/apktool-release.json"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$RUNNER_TEMP/private-apk-tools/apktool-release.json" | head -n1)"
+          if [[ ! "$APKTOOL_URL" =~ ^https://github\.com/ ]]; then
+            echo "Apktool release asset URL missing or unexpected"
+            jq -r '.tag_name, (.assets[]?.name)' "$RUNNER_TEMP/private-apk-tools/apktool-release.json"
+            exit 1
+          fi
+          echo "Downloading Apktool release asset"
+          curl -fsSL "$APKTOOL_URL" -o "$RUNNER_TEMP/private-apk-tools/apktool.jar"
+          test -s "$RUNNER_TEMP/private-apk-tools/apktool.jar"
+
+          echo "Fetching JADX release metadata"
+          curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$RUNNER_TEMP/private-apk-tools/jadx-release.json"
           JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\\.zip$")) | .browser_download_url' "$RUNNER_TEMP/private-apk-tools/jadx-release.json" | head -n1)"
-          test -n "$JADX_URL"
+          if [[ ! "$JADX_URL" =~ ^https://github\.com/ ]]; then
+            echo "JADX release asset URL missing or unexpected"
+            jq -r '.tag_name, (.assets[]?.name)' "$RUNNER_TEMP/private-apk-tools/jadx-release.json"
+            exit 1
+          fi
+          echo "Downloading JADX release asset"
           curl -fsSL "$JADX_URL" -o "$RUNNER_TEMP/private-apk-tools/jadx.zip"
+          test -s "$RUNNER_TEMP/private-apk-tools/jadx.zip"
+
           mkdir -p "$RUNNER_TEMP/private-apk-tools/jadx"
           unzip -q "$RUNNER_TEMP/private-apk-tools/jadx.zip" -d "$RUNNER_TEMP/private-apk-tools/jadx"
           JADX_BIN="$(find "$RUNNER_TEMP/private-apk-tools/jadx" -type f -path '*/bin/jadx' | head -n1)"
           test -n "$JADX_BIN"
           chmod +x "$JADX_BIN"
+          echo "APKTOOL_JAR=$RUNNER_TEMP/private-apk-tools/apktool.jar" >> "$GITHUB_ENV"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+          echo "Apktool version: $(java -jar "$RUNNER_TEMP/private-apk-tools/apktool.jar" --version)"
+          echo "JADX version: $("$JADX_BIN" --version 2>&1 | tail -n1)"
 
-          # Keep all APK-derived output in the ephemeral runner workspace; never publish it.
-          java -jar "$RUNNER_TEMP/private-apk-tools/apktool.jar" d -f "$APK" -o "$RUNNER_TEMP/private-apk-tools/decoded" > "$RUNNER_TEMP/private-apk-tools/apktool.log" 2>&1
+      - name: Decode original APK with Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          java -jar "$APKTOOL_JAR" d -f "$APK" -o "$RUNNER_TEMP/private-apk-tools/decoded"
           test -s "$RUNNER_TEMP/private-apk-tools/decoded/AndroidManifest.xml"
+          echo "Apktool decode: PASS"
 
-          "$JADX_BIN" --output-dir "$RUNNER_TEMP/private-apk-tools/jadx-out" "$APK" > "$RUNNER_TEMP/private-apk-tools/jadx.log" 2>&1
+      - name: Decompile original APK with JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          "$JADX_BIN" --output-dir "$RUNNER_TEMP/private-apk-tools/jadx-out" "$APK"
           test -d "$RUNNER_TEMP/private-apk-tools/jadx-out"
           test -n "$(find "$RUNNER_TEMP/private-apk-tools/jadx-out" -type f -print -quit)"
+          echo "JADX decompile: PASS"
 
+      - name: Write non-sensitive smoke-test summary
+        if: success()
+        shell: bash
+        run: |
           {
             echo "## Private APK smoke test"
             echo
@@ -78,7 +125,7 @@ jobs:
             echo "- Apktool decode: PASS."
             echo "- JADX decompile: PASS."
             echo "- APK-derived files, logs, and source were not committed or uploaded as artifacts."
-            echo "- This run validates analysis access and tooling only; no APK modifications were made."
+            echo "- No APK modifications were made."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove temporary private source and analysis files
