@@ -1,0 +1,219 @@
+name: Private EPUB CSS cascade deep trace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-epub-css-cascade-deep-trace
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout isolated public pipeline
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout original APK and prior private trace
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: analysis/epub-css-source-44103498660
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+            reports/private-epub-traces/css-smali-44103498660.md
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify original APK integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          TRACE="_private-source/reports/private-epub-traces/css-smali-44103498660.md"
+          test -s "$APK" && test -s "$TRACE"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK integrity: PASS"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-cascade"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/release.json"
+          URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/release.json" | head -n1)"
+          [[ "$URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$URL" -o "$WORK/apktool.jar"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+
+      - name: Decode APK privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-cascade"
+          java -jar "$APKTOOL_JAR" d -f "_private-source/AlReaderX E-Ink-1.33.apk" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          echo "Smali decode: PASS"
+
+      - name: Extract hierarchy and complete method bodies
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-cascade"
+          REPORT="_private-source/reports/private-epub-traces/css-cascade-deep-$GITHUB_RUN_ID.md"
+          mkdir -p "$(dirname "$REPORT")"
+          python3 - "$WORK/decoded" "$REPORT" <<'PY'
+          import os,sys,re
+          root,report=sys.argv[1:3]
+          files={}
+          for base,_,names in os.walk(root):
+              for name in names:
+                  if name.endswith(".smali"):
+                      p=os.path.join(base,name)
+                      rel=os.path.relpath(p,root).replace(os.sep,"/")
+                      try:
+                          with open(p,encoding="utf-8",errors="replace") as f: files[rel]=f.readlines()
+                      except OSError: pass
+          headers={}
+          for path,lines in files.items():
+              cls=next((m.group(1) for x in lines if (m:=re.search(r"^\.class\s+.*?(L[^;]+;)",x))),None)
+              sup=next((m.group(1) for x in lines if (m:=re.search(r"^\.super\s+(L[^;]+;)",x))),None)
+              if cls: headers[cls]=(path,sup)
+          def methods(lines):
+              i=0
+              while i<len(lines):
+                  if lines[i].startswith(".method "):
+                      s=i
+                      while i<len(lines) and not lines[i].startswith(".end method"): i+=1
+                      yield s,min(i+1,len(lines)),"".join(lines[s:min(i+1,len(lines))])
+                  i+=1
+          def emit_methods(out,desc,names=None,regex=None,cap=40):
+              if desc not in headers:
+                  out.write("Class not resolved: "+desc+"\n\n"); return
+              path,_=headers[desc]; found=0
+              out.write("### "+path+"\n\n")
+              for s,e,body in methods(files[path]):
+                  first=body.splitlines()[0]
+                  m=re.search(r"\.method\s+.*?\s([^ (]+)",first)
+                  name=m.group(1) if m else ""
+                  if names is not None and name not in names: continue
+                  if regex and not re.search(regex,first): continue
+                  out.write("#### Lines %d-%d: %s\n\n%s\n\n"%(s+1,e,first.strip(),body))
+                  found+=1
+                  if found>=cap: break
+              if not found: out.write("No matching method body in decoded output; not proof of absence.\n\n")
+          def all_defs(out,rx,cap=100):
+              count=0
+              for path,lines in sorted(files.items()):
+                  for s,e,body in methods(lines):
+                      first=body.splitlines()[0]
+                      if re.search(rx,first):
+                          out.write("### %s lines %d-%d: %s\n\n%s\n\n"%(path,s+1,e,first.strip(),body))
+                          count+=1
+                          if count>=cap: out.write("Definition cap reached.\n\n"); return
+              if not count: out.write("No definitions found in decoded output.\n\n")
+          def contexts(out,rx,cap=40):
+              count=0
+              for path,lines in sorted(files.items()):
+                  hits=[i for i,x in enumerate(lines) if re.search(rx,x,re.I)]
+                  if not hits: continue
+                  out.write("### %s (%d matching lines)\n\n"%(path,len(hits)))
+                  spans=[]
+                  for i in hits:
+                      lo=max(0,i-4); hi=min(len(lines),i+11)
+                      if spans and lo<=spans[-1][1]: spans[-1]=(spans[-1][0],max(spans[-1][1],hi))
+                      else: spans.append((lo,hi))
+                  for lo,hi in spans:
+                      out.write("#### Lines %d-%d\n\n"%(lo+1,hi))
+                      for j in range(lo,hi): out.write("%d: %s"%(j+1,lines[j]))
+                      out.write("\n")
+                      count+=1
+                      if count>=cap: out.write("Context cap reached.\n\n"); return
+          cssset="Lcom/neverland/engbook/allstyles/AlSetCSS;"
+          chain=[]; seen=set(); cur=cssset
+          while cur and cur not in seen and cur in headers:
+              seen.add(cur); chain.append(cur); cur=headers[cur][1]
+          with open(report,"w",encoding="utf-8") as out:
+              out.write("# Private EPUB CSS cascade deep trace\n\n")
+              out.write("- Decoded Smali files: %d\n- Original APK integrity checked before decoding\n- Detailed output is private; this report is static analysis only.\n\n"%len(files))
+              out.write("## 1. AlSetCSS class and superclass chain\n\n")
+              if not chain: out.write("AlSetCSS descriptor not found.\n\n")
+              for d in chain:
+                  path,sup=headers[d]
+                  out.write("### %s\n\n- class: %s\n- superclass: %s\n\n"%(path,d,sup or "not declared"))
+              out.write("## 2. AlCSSStyles complete selector and temporary CSS methods\n\n")
+              emit_methods(out,"Lcom/neverland/engbook/allstyles/AlCSSStyles;",{"apply1OneClassX","parseTemp"},cap=10)
+              out.write("## 3. All apply_WEIGHT method definitions across decoded Smali\n\n")
+              all_defs(out,r"apply_WEIGHT_",100)
+              out.write("## 4. acceptValue, applyValue and weight methods in AlSetCSS hierarchy\n\n")
+              wanted={"acceptValue","applyValue","apply_WEIGHT_1","apply_WEIGHT_2","apply_WEIGHT_10","apply_WEIGHT_11","apply_WEIGHT_12","apply_WEIGHT_13","apply_WEIGHT_14","apply_WEIGHT_15","apply_WEIGHT_16","apply_WEIGHT_17","apply_WEIGHT_18","apply_WEIGHT_19","apply_WEIGHT_20","apply_WEIGHT_21","apply_WEIGHT_22"}
+              for d in chain: emit_methods(out,d,wanted,cap=60)
+              out.write("## 5. Property mask merge method\n\n")
+              emit_methods(out,"Lcom/neverland/engbook/allstyles/AlOneCSSPair;",{"mixFrom"},cap=5)
+              out.write("## 6. Style stack methods and mutation paths\n\n")
+              emit_methods(out,"Lcom/neverland/engbook/allstyles/AlStyleStack;",regex=r"apply|push|pop|set|merge|mix|value",cap=35)
+              out.write("## 7. Font and important indicators\n\n")
+              contexts(out,r"!important|important|font-family|font-weight|font-style|font-size",45)
+              out.write("## 8. Cross-class invokes of cascade and parser methods\n\n")
+              contexts(out,r"invoke-.*(apply_WEIGHT_|applyValue|acceptValue|mixFrom|parseTemp|setRealCSS)",45)
+              out.write("## Interpretation limits\n\n")
+              out.write("- Missing methods in a partial decode do not prove absence; the full resolved superclass chain and all definitions are checked where present.\n")
+              out.write("- Invocation order alone does not define the complete cascade; selector specificity, source order, branches and property masks must be followed.\n")
+              out.write("- Literal !important searches are indicators only; parser flags may encode priority without retaining that string.\n")
+              out.write("- No APK modification or runtime rendering claim is made.\n")
+          print("Private deep cascade report created.")
+          PY
+
+      - name: Commit detailed report to private branch
+        shell: bash
+        env:
+          PRIVATE_REPORT_WRITE_TOKEN: ${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd _private-source
+          BRANCH="analysis/epub-css-cascade-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add --sparse "reports/private-epub-traces/css-cascade-deep-$GITHUB_RUN_ID.md"
+          git commit -m "Add private EPUB CSS cascade deep trace"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$BRANCH"
+          echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Publish sanitized public summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Private EPUB CSS cascade deep trace"
+            echo
+            echo "- Original APK integrity was checked before private decoding."
+            echo "- Detailed Smali method bodies are stored only in the private source repository."
+            echo "- No APK, decompiled source, class names, private paths or excerpts are published here."
+            echo "- Private report branch: ${PRIVATE_REPORT_BRANCH:-not created}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-epub-css-cascade"
