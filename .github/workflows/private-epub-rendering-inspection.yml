@@ -1,0 +1,167 @@
+name: Private EPUB rendering path indicators
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-epub-rendering-inspection
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out public pipeline repository
+        uses: actions/checkout@v5
+
+      - name: Check out only the original APK from the private repository
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: main
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify original APK integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK integrity: PASS"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download analysis tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-inspection"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/apktool-release.json"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
+          [[ "$APKTOOL_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$APKTOOL_URL" -o "$WORK/apktool.jar"
+          curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$WORK/jadx-release.json"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\\.zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
+          [[ "$JADX_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$JADX_URL" -o "$WORK/jadx.zip"
+          mkdir -p "$WORK/jadx"
+          unzip -q "$WORK/jadx.zip" -d "$WORK/jadx"
+          JADX_BIN="$(find "$WORK/jadx" -type f -path '*/bin/jadx' | head -n1)"
+          test -n "$JADX_BIN"
+          chmod +x "$JADX_BIN"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+
+      - name: Decode and partially decompile
+        shell: bash
+        run: |
+          set -uo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          WORK="$RUNNER_TEMP/private-epub-inspection"
+          java -jar "$APKTOOL_JAR" d -f "$APK" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          set +e
+          "$JADX_BIN" --show-bad-code --output-dir "$WORK/jadx-out" "$APK" > "$WORK/jadx.log" 2>&1
+          JADX_EXIT=$?
+          set -e
+          FILE_COUNT="$(find "$WORK/jadx-out" -type f 2>/dev/null | wc -l | tr -d ' ')"
+          ERROR_COUNT="$(grep -E 'finished with errors, count:' "$WORK/jadx.log" | tail -n1 | sed 's/.*count: //' || true)"
+          if [[ "$FILE_COUNT" -eq 0 ]]; then
+            echo "JADX generated no source output"
+            exit 1
+          fi
+          if [[ "$JADX_EXIT" -eq 0 ]]; then
+            RESULT=PASS
+          elif [[ "$JADX_EXIT" -eq 3 ]]; then
+            RESULT=PARTIAL
+          else
+            echo "JADX failed with unexpected exit code $JADX_EXIT"
+            exit "$JADX_EXIT"
+          fi
+          echo "JADX_RESULT=$RESULT" >> "$GITHUB_ENV"
+          echo "JADX_FILES=$FILE_COUNT" >> "$GITHUB_ENV"
+          echo "JADX_ERRORS=${ERROR_COUNT:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Extract EPUB rendering relationships as aggregate counts
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-inspection"
+          python3 - "$WORK/jadx-out" "$WORK/decoded" <<'PY'
+          import os, sys, re, collections
+          source_dir, decoded_dir = sys.argv[1:]
+          exts = ('.java', '.kt', '.smali', '.xml')
+          files = []
+          for base, _, names in os.walk(source_dir):
+              for name in names:
+                  if name.endswith(exts):
+                      path = os.path.join(base, name)
+                      try:
+                          with open(path, encoding='utf-8', errors='ignore') as f:
+                              data = f.read()
+                      except OSError:
+                          continue
+                      files.append((path, data))
+          groups = {
+              'epub': (r'epub', r'application/epub\+zip', r'ZipFile', r'ZipInputStream'),
+              'html_dom': (r'org\.jsoup', r'Html\.fromHtml', r'DocumentBuilder', r'loadDataWithBaseURL', r'text/html'),
+              'webview': (r'android\.webkit\.WebView', r'WebViewClient', r'WebChromeClient', r'addJavascriptInterface'),
+              'css': (r'text/css', r'\.css', r'insertCSS', r'CSSStyleSheet', r'cssText'),
+              'fonts': (r'Typeface', r'AssetManager', r'\.ttf', r'\.otf', r'\.woff', r'FontFamily'),
+              'pagination': (r'pageBreak', r'page-break', r'pagination', r'paginate', r'getPageCount'),
+              'style_config': (r'font-family', r'font-size', r'line-height', r'text-indent', r'font-weight', r'font-style'),
+          }
+          compiled = {k: [re.compile(p, re.I) for p in v] for k,v in groups.items()}
+          counts = collections.Counter()
+          for _, data in files:
+              hit = {k:any(p.search(data) for p in pats) for k,pats in compiled.items()}
+              for k, yes in hit.items():
+                  if yes: counts[k] += 1
+              for combo in ('epub+html_dom','html_dom+webview','webview+css','css+fonts','epub+pagination','css+style_config','webview+fonts'):
+                  a,b = combo.split('+')
+                  if hit[a] and hit[b]: counts['pair:'+combo] += 1
+          # Also report decoded manifest/asset file totals, without filenames or values.
+          decoded_files = 0
+          for _, _, names in os.walk(decoded_dir):
+              decoded_files += len(names)
+          summary = os.environ['GITHUB_STEP_SUMMARY']
+          with open(summary, 'a', encoding='utf-8') as out:
+              out.write('## Private EPUB rendering-path inspection (aggregate-only)\n\n')
+              out.write('- Original APK integrity: **PASS**.\n')
+              out.write(f'- JADX result: **{os.environ.get("JADX_RESULT","UNKNOWN")}**; generated files: **{os.environ.get("JADX_FILES","0")}**; reported errors: **{os.environ.get("JADX_ERRORS","unknown")}**.\n')
+              out.write(f'- Decompiled source/XML files scanned: **{len(files)}**; decoded files: **{decoded_files}**.\n\n')
+              out.write('### Files containing each indicator group\n\n')
+              labels = {'epub':'EPUB/container','html_dom':'HTML/DOM','webview':'WebView/JavaScript bridge','css':'CSS','fonts':'font loading','pagination':'pagination/page count','style_config':'typography/style properties'}
+              for key,label in labels.items():
+                  out.write(f'- {label}: **{counts[key]}** files.\n')
+              out.write('\n### Files containing both indicator groups\n\n')
+              pairs = ('epub+html_dom','html_dom+webview','webview+css','css+fonts','epub+pagination','css+style_config','webview+fonts')
+              for pair in pairs:
+                  out.write(f'- {pair.replace("+"," + ")}: **{counts["pair:"+pair]}** files.\n')
+              out.write('\nThese are co-occurrence counts only. They do not identify classes, expose source text, or prove runtime execution. JADX is partial, so absence of an indicator is not proof that a feature is absent.\n')
+          PY
+
+      - name: Remove temporary private source and analysis files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-epub-inspection"
