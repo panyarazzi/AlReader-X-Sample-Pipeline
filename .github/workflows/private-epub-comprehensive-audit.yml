@@ -1,0 +1,219 @@
+name: Private EPUB comprehensive engine audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-epub-comprehensive-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout isolated public pipeline
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Checkout original APK privately
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: main
+          token: \${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify original APK blob integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Source APK blob integrity: PASS"
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Download Apktool and JADX once
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/epub-comprehensive-audit"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/apktool-release.json"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
+          [[ "$APKTOOL_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$APKTOOL_URL" -o "$WORK/apktool.jar"
+          curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$WORK/jadx-release.json"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+[.]zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
+          [[ "$JADX_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$JADX_URL" -o "$WORK/jadx.zip"
+          mkdir -p "$WORK/jadx"
+          unzip -q "$WORK/jadx.zip" -d "$WORK/jadx"
+          JADX_BIN="$(find "$WORK/jadx" -type f -path '*/bin/jadx' | head -n1)"
+          test -n "$JADX_BIN"
+          chmod +x "$JADX_BIN"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+      - name: Decode Smali and decompile once
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          WORK="$RUNNER_TEMP/epub-comprehensive-audit"
+          java -jar "$APKTOOL_JAR" d -f "$APK" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          set +e
+          "$JADX_BIN" --show-bad-code --output-dir "$WORK/jadx-out" "$APK" > "$WORK/jadx.log" 2>&1
+          RC=$?
+          set -e
+          FILES="$(find "$WORK/jadx-out" -type f 2>/dev/null | wc -l | tr -d ' ')"
+          ERRORS="$(grep -E 'finished with errors, count:' "$WORK/jadx.log" | tail -n1 | sed 's/.*count: //' || true)"
+          test "$FILES" -gt 0
+          if [ "$RC" -eq 0 ]; then RESULT=PASS; elif [ "$RC" -eq 3 ]; then RESULT=PARTIAL; else echo "Unexpected JADX exit code: $RC"; exit "$RC"; fi
+          echo "JADX_RESULT=$RESULT" >> "$GITHUB_ENV"
+          echo "JADX_FILES=$FILES" >> "$GITHUB_ENV"
+          echo "JADX_ERRORS=\${ERRORS:-unknown}" >> "$GITHUB_ENV"
+      - name: Generate consolidated private evidence report
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/epub-comprehensive-audit"
+          REPORT="_private-source/reports/private-epub-traces/comprehensive-audit-$GITHUB_RUN_ID.md"
+          mkdir -p "$(dirname "$REPORT")"
+          python3 - "$WORK/decoded" "$REPORT" <<'PY'
+          import os,sys,re
+          root,report=sys.argv[1:3]
+          files={}
+          for base,_,names in os.walk(root):
+              for n in names:
+                  if n.endswith('.smali'):
+                      p=os.path.join(base,n); rel=os.path.relpath(p,root).replace(os.sep,'/')
+                      try:
+                          with open(p,encoding='utf-8',errors='replace') as f: files[rel]=f.readlines()
+                      except OSError: pass
+          classes={}; methods=[]
+          for path,lines in files.items():
+              desc=next((m.group(1) for x in lines if (m:=re.search(r'^\.class\s+.*?(L[^;]+;)',x))),None)
+              sup=next((m.group(1) for x in lines if (m:=re.search(r'^\.super\s+(L[^;]+;)',x))),None)
+              if desc: classes[desc]=(path,sup)
+              i=0
+              while i<len(lines):
+                  if lines[i].startswith('.method '):
+                      s=i
+                      while i<len(lines) and not lines[i].startswith('.end method'): i+=1
+                      e=min(i+1,len(lines)); methods.append((path,s+1,e,''.join(lines[s:e]),desc))
+                  i+=1
+          def emit(out,title,items,cap=None):
+              out.write('## '+title+'\n\n'); count=0
+              for p,s,e,b,d in items:
+                  out.write('### '+str(d or p)+' — '+p+':'+str(s)+'-'+str(e)+'\n\n')
+                  for line in b.splitlines(): out.write('    '+line+'\n')
+                  out.write('\n'); count+=1
+                  if cap and count>=cap: break
+              out.write('- Method bodies included: '+str(count)+'\n\n')
+          def find(pattern,pathpat=None):
+              rx=re.compile(pattern,re.I); pr=re.compile(pathpat,re.I) if pathpat else None
+              return [x for x in methods if rx.search(x[3]) and (pr is None or pr.search(x[0]))]
+          def class_methods(desc):
+              if desc not in classes: return []
+              return [x for x in methods if x[0]==classes[desc][0]]
+          targets=[
+          'Lcom/neverland/engbook/formats/AlFormatEPUB;',
+          'Lcom/neverland/engbook/formats/AlFormatBaseHTML;',
+          'Lcom/neverland/engbook/formats/AlAXML;',
+          'Lcom/neverland/engbook/allstyles/AlCSSHtml;',
+          'Lcom/neverland/engbook/allstyles/AlCSSStyles;',
+          'Lcom/neverland/engbook/allstyles/AlSetCSS;',
+          'Lcom/neverland/engbook/allstyles/AlOneCSSPair;',
+          'Lcom/neverland/engbook/allstyles/AlStyleStack;',
+          'Lcom/neverland/engbook/book/TBookCSS;',
+          'Lcom/neverland/engbook/book/TBook;',
+          'Lcom/neverland/engbook/AlBookEng;']
+          with open(report,'w',encoding='utf-8') as o:
+              o.write('# Private EPUB comprehensive engine audit\n\n')
+              o.write('- Run ID: '+os.environ.get('GITHUB_RUN_ID','unknown')+'\n')
+              o.write('- Decoded Smali files: '+str(len(files))+'; indexed methods: '+str(len(methods))+'\n')
+              o.write('- Original APK Git blob integrity checked before decode.\n- Static inspection only; no APK modification.\n- Detailed report stored only in the private repository.\n\n')
+              o.write('## 1. JADX coverage\n\n- Result: '+os.environ.get('JADX_RESULT','unknown')+'; files: '+os.environ.get('JADX_FILES','unknown')+'; errors: '+os.environ.get('JADX_ERRORS','unknown')+'\n- JADX and Smali are complementary; partial output is not treated as complete source.\n\n')
+              o.write('## 2. EPUB entry, inheritance and HTML rendering\n\n')
+              for d in targets[:3]:
+                  if d not in classes: o.write('### UNRESOLVED '+d+'\n\n')
+                  else:
+                      p,sup=classes[d]; o.write('### '+d+'\n\n- File: '+p+'\n- Superclass: '+str(sup)+'\n\n'); emit(o,'Complete class methods',class_methods(d))
+              emit(o,'EPUB and HTML parser callsites',find(r'prepareTAG|AlFormatEPUB|AlFormatBaseHTML|AlAXML;->|AlCSSHtml;->'))
+              o.write('## 3. CSS parser, selector matching, cascade and property merge\n\n')
+              for d in targets[3:8]:
+                  if d not in classes: o.write('### UNRESOLVED '+d+'\n\n')
+                  else:
+                      p,sup=classes[d]; o.write('### '+d+'\n\n- File: '+p+'\n- Superclass: '+str(sup)+'\n\n'); emit(o,'Complete class methods',class_methods(d))
+              emit(o,'CSS weight, priority, important and merge callsites',find(r'apply_WEIGHT_|apply1OneClassX|apply1ClassX|acceptValue|applyValue|mixFrom|important|parseTemp|parseFile|currentSet|allSets'))
+              o.write('## 4. External stylesheets, imports and ordering\n\n')
+              emit(o,'All stylesheet/import/Work Set callsites',find(r'parseFile|@import|text/css|currentSet|allSets|stylesheet|manifest|spine|\.css'))
+              o.write('## 5. Inline CSS and generated/user CSS\n\n')
+              emit(o,'Inline style and generated CSS callsites',find(r'parseTemp|setRealStyleCSS|getCSSString|updateRealCSS|setRealCSS|styleValue|disableExternal'))
+              for d in targets[8:]:
+                  if d not in classes: o.write('### UNRESOLVED '+d+'\n\n')
+                  else:
+                      p,sup=classes[d]; o.write('### '+d+'\n\n- File: '+p+'\n- Superclass: '+str(sup)+'\n\n'); emit(o,'Complete class methods',class_methods(d))
+              o.write('## 6. Application settings and option-bit provenance\n\n')
+              emit(o,'All option and disableExternal reads/writes',find(r'formatOptionsWorked|disableExternal|const-wide|and-long|ushr-long|shl-long|SharedPreferences|Preference'))
+              o.write('## 7. EPUB archive resources and embedded-font candidates\n\n')
+              emit(o,'Font parser, archive lookup, Typeface construction/application',find(r'@font-face|font-family|font-weight|font-style|font-size|\.ttf|\.otf|\.woff|ZipFile|ZipEntry|openEntry|Typeface;->|createFromAsset|createFromFile|createFromStream|setTypeface'))
+              o.write('## 8. Evidence limits and acceptance gaps\n\n')
+              o.write('- A symbol/string match is a lead, not proof; connect caller, arguments/registers, state writes, downstream consumers and ordering.\n')
+              o.write('- Do not equate proprietary selector weights with CSS specificity without dispatch and matching evidence.\n')
+              o.write('- !important requires proof that parser state survives and downstream priority changes merge order.\n')
+              o.write('- Embedded-font support requires an end-to-end path from EPUB CSS to archive entry, Typeface and text application.\n')
+              o.write('- Interpret disableExternal from all setters, reads and effects; do not reuse it as Publisher Style toggle without proof.\n')
+              o.write('- Missing symbols in partial decompilation are unresolved, not proof of absence.\n')
+              o.write('- Static inspection does not replace controlled runtime EPUB tests.\n')
+          print('Consolidated private evidence report created.')
+          PY
+      - name: Commit detailed report to private analysis branch
+        shell: bash
+        env:
+          PRIVATE_REPORT_WRITE_TOKEN: \${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd _private-source
+          BRANCH="analysis/epub-comprehensive-audit-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add --sparse "reports/private-epub-traces/comprehensive-audit-$GITHUB_RUN_ID.md"
+          git commit -m "Add private EPUB comprehensive engine audit"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$BRANCH"
+          echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+      - name: Publish sanitized aggregate summary only
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Private EPUB comprehensive audit"
+            echo
+            echo "- Original APK blob integrity checked before analysis."
+            echo "- One APK decode and one JADX pass were used."
+            echo "- Detailed evidence remains in a private branch."
+            echo "- No APK, decompiled tree, source excerpts, private paths or resource contents are published."
+            echo "- Private report branch: \${PRIVATE_REPORT_BRANCH:-not created}."
+            echo "- JADX: \${JADX_RESULT:-not completed}; files: \${JADX_FILES:-unknown}; errors: \${JADX_ERRORS:-unknown}."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Cleanup private source and analysis output
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/epub-comprehensive-audit"
