@@ -98,7 +98,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WORK="$RUNNER_TEMP/private-epub-css-smali"
+          WORK="$RUNNER_TEMP/private-epub-css-smali-trace"
           REPORT="_private-source/reports/private-epub-traces/css-smali-$GITHUB_RUN_ID.md"
           mkdir -p "$(dirname "$REPORT")"
           python3 - "$WORK/decoded" "$REPORT" <<'PY'
