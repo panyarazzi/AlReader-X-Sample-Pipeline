@@ -1,0 +1,184 @@
+name: Private EPUB stylesheet font and external CSS trace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-epub-stylesheet-font-trace
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout isolated public pipeline
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Checkout original APK privately
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: analysis/epub-css-cascade-44107513195
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify original APK integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK integrity: PASS"
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Download Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-deep"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/release.json"
+          URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/release.json" | head -n1)"
+          [[ "$URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$URL" -o "$WORK/apktool.jar"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+      - name: Decode APK privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-deep"
+          java -jar "$APKTOOL_JAR" d -f "_private-source/AlReaderX E-Ink-1.33.apk" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          echo "Private Smali decode: PASS"
+      - name: Trace stylesheet imports, disableExternal and font application
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-deep"
+          REPORT="_private-source/reports/private-epub-traces/stylesheet-font-external-$GITHUB_RUN_ID.md"
+          mkdir -p "$(dirname "$REPORT")"
+          python3 - "$WORK/decoded" "$REPORT" <<'PY'
+          import os,sys,re
+          root,report=sys.argv[1:3]
+          files={}
+          for base,_,names in os.walk(root):
+              for n in names:
+                  if n.endswith(".smali"):
+                      p=os.path.join(base,n); rel=os.path.relpath(p,root).replace(os.sep,"/")
+                      try:
+                          with open(p,encoding="utf-8",errors="replace") as f: files[rel]=f.readlines()
+                      except OSError: pass
+          headers={}
+          for path,lines in files.items():
+              cls=next((m.group(1) for x in lines if (m:=re.search(r"^\.class\s+.*?(L[^;]+;)",x))),None)
+              sup=next((m.group(1) for x in lines if (m:=re.search(r"^\.super\s+(L[^;]+;)",x))),None)
+              if cls: headers[cls]=(path,sup)
+          def iter_methods(lines):
+              i=0
+              while i<len(lines):
+                  if lines[i].startswith(".method "):
+                      s=i
+                      while i<len(lines) and not lines[i].startswith(".end method"): i+=1
+                      yield s,min(i+1,len(lines)),"".join(lines[s:min(i+1,len(lines))])
+                  i+=1
+          def emit(out,title,items,limit=None):
+              out.write("## "+title+"\n\n")
+              count=0
+              for path,s,e,body in items:
+                  out.write("### "+path+" — lines "+str(s+1)+"-"+str(e)+"\n\n")
+                  out.write("```smali\n"+body+"```\n\n")
+                  count+=1
+                  if limit and count>=limit: break
+              out.write("- Matching method bodies included: "+str(count)+"\n\n")
+          all_methods=[]
+          for path,lines in sorted(files.items()):
+              for s,e,b in iter_methods(lines): all_methods.append((path,s,e,b))
+          def match_items(pattern, class_pattern=None):
+              rx=re.compile(pattern,re.I)
+              crx=re.compile(class_pattern,re.I) if class_pattern else None
+              return [(p,s,e,b) for p,s,e,b in all_methods if rx.search(b) and (not crx or crx.search(p))]
+          def class_items(descs):
+              out=[]
+              for d in descs:
+                  if d not in headers: out.append(("UNRESOLVED "+d,0,0,"Class not resolved in this decode.\n")); continue
+                  p,sup=headers[d]; lines=files[p]
+                  for s,e,b in iter_methods(lines): out.append((p+" ["+d+"; superclass="+str(sup)+"]",s,e,b))
+              return out
+          with open(report,"w",encoding="utf-8") as out:
+              out.write("# Private EPUB stylesheet, external CSS and font trace\n\n")
+              out.write("- Decoded Smali files: "+str(len(files))+"\n- Original APK blob integrity verified before decoding.\n- Static inspection only; no APK modifications.\n- Detailed report is private; this report is not copied to the public repository.\n\n")
+              emit(out,"1. Stylesheet loading, @import, EPUB references and Work Set mutations",
+                   match_items(r"parseFile|@import|text/css|currentSet|allSets|\.css|stylesheet|href|manifest|spine",r"AlCSS|AlFormatEPUB|AlFormatBaseHTML|AlAXML|AlScanEPUB|Al.*EPUB"))
+              emit(out,"2. Every disableExternal read/write and surrounding method",
+                   match_items(r"disableExternal|Z.*disableExternal|disableExternal.*Z"))
+              emit(out,"3. Font-face parser, font-family and archive/resource lookup candidates",
+                   match_items(r"@font-face|font-family|font-weight|font-style|font-size|\.ttf|\.otf|\.woff2?|ZipFile|ZipEntry|openEntry|open.*File|asset.*font|font.*asset"))
+              emit(out,"4. Typeface creation, loading and application callsites",
+                   match_items(r"Typeface;->|Landroid/graphics/Typeface;|createFromAsset|createFromFile|createFromStream|setTypeface|\.ttf|\.otf|\.woff2?"))
+              emit(out,"5. Exact CSS engine class methods (complete class method bodies)",
+                   class_items([
+                    "Lcom/neverland/engbook/allstyles/AlCSSStyles;",
+                    "Lcom/neverland/engbook/allstyles/AlSetCSS;",
+                    "Lcom/neverland/engbook/allstyles/AlCSSHtml;",
+                    "Lcom/neverland/engbook/allstyles/AlStyleStack;",
+                    "Lcom/neverland/engbook/formats/AlFormatEPUB;",
+                    "Lcom/neverland/engbook/formats/AlFormatBaseHTML;",
+                    "Lcom/neverland/engbook/formats/AlAXML;"
+                   ]))
+              out.write("## 6. Interpretation and evidence limits\n\n")
+              out.write("- A string or method-name match is only a lead; claims require connected callsites, arguments/register flow and downstream effects.\n")
+              out.write("- A stylesheet reference is not proof of final cascade order; report actual Work Set insertion and iteration order separately.\n")
+              out.write("- disableExternal must be traced from writes to reads and then to changed property masks/behavior before assigning meaning.\n")
+              out.write("- @font-face support requires a connected path from CSS parsing through EPUB archive entry lookup to Typeface construction and application.\n")
+              out.write("- Absence of a match in partial decompilation is not proof that a feature is absent.\n")
+              out.write("- No source, APK, decompiled tree or method excerpts may be published to the public pipeline repository.\n")
+          print("Private stylesheet/font/external CSS trace report created.")
+          PY
+      - name: Commit detailed report to private branch
+        shell: bash
+        env:
+          PRIVATE_REPORT_WRITE_TOKEN: ${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd _private-source
+          BRANCH="analysis/epub-stylesheet-font-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add --sparse "reports/private-epub-traces/stylesheet-font-external-$GITHUB_RUN_ID.md"
+          git commit -m "Add private EPUB stylesheet and font trace"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$BRANCH"
+          echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+      - name: Publish sanitized public summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Private EPUB stylesheet/font/external CSS trace"
+            echo
+            echo "- Original APK integrity checked before private decoding."
+            echo "- Detailed Smali evidence is stored only in the private repository."
+            echo "- No APK, decompiled source, private paths or method excerpts are published."
+            echo "- Private report branch: ${PRIVATE_REPORT_BRANCH:-not created}."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-epub-deep"
