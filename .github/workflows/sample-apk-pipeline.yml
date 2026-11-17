@@ -1,0 +1,132 @@
+name: Validate sample APK analysis pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sample-apk-pipeline.yml"
+      - "scripts/build-sample-apk.sh"
+      - "tests/fixtures/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sample-apk-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    # Standard GitHub-hosted Ubuntu runner; standard runners are free for public repositories.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download Apktool and JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/apk-tools"
+
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$RUNNER_TEMP/apktool-release.json"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$RUNNER_TEMP/apktool-release.json" | head -n1)"
+          test -n "$APKTOOL_URL"
+          curl -fsSL "$APKTOOL_URL" -o "$RUNNER_TEMP/apk-tools/apktool.jar"
+
+          curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$RUNNER_TEMP/jadx-release.json"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\\.zip$")) | .browser_download_url' "$RUNNER_TEMP/jadx-release.json" | head -n1)"
+          test -n "$JADX_URL"
+          curl -fsSL "$JADX_URL" -o "$RUNNER_TEMP/apk-tools/jadx.zip"
+          mkdir -p "$RUNNER_TEMP/apk-tools/jadx"
+          unzip -q "$RUNNER_TEMP/apk-tools/jadx.zip" -d "$RUNNER_TEMP/apk-tools/jadx"
+          JADX_BIN="$(find "$RUNNER_TEMP/apk-tools/jadx" -type f -path '*/bin/jadx' | head -n1)"
+          test -n "$JADX_BIN"
+          chmod +x "$JADX_BIN"
+
+          echo "APKTOOL_JAR=$RUNNER_TEMP/apk-tools/apktool.jar" >> "$GITHUB_ENV"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+          java -jar "$RUNNER_TEMP/apk-tools/apktool.jar" --version
+          "$JADX_BIN" --version
+
+      - name: Build isolated synthetic APK fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/build-sample-apk.sh "$RUNNER_TEMP/sample-fixture"
+          APK="$RUNNER_TEMP/sample-fixture/sample-fixture.apk"
+          test -s "$APK"
+          sha256sum "$APK" | tee "$RUNNER_TEMP/sample-fixture/sha256.txt"
+          stat -c 'bytes=%s' "$APK" | tee "$RUNNER_TEMP/sample-fixture/size.txt"
+
+      - name: Decode fixture with Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -jar "$APKTOOL_JAR" d -f "$RUNNER_TEMP/sample-fixture/sample-fixture.apk" -o "$RUNNER_TEMP/sample-fixture/decoded"
+          test -s "$RUNNER_TEMP/sample-fixture/decoded/AndroidManifest.xml"
+          find "$RUNNER_TEMP/sample-fixture/decoded" -maxdepth 2 -type f | sort > "$RUNNER_TEMP/sample-fixture/apktool-file-list.txt"
+
+      - name: Decompile fixture with JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JADX_BIN" --output-dir "$RUNNER_TEMP/sample-fixture/jadx" "$RUNNER_TEMP/sample-fixture/sample-fixture.apk"
+          test -d "$RUNNER_TEMP/sample-fixture/jadx"
+          find "$RUNNER_TEMP/sample-fixture/jadx" -type f | sort > "$RUNNER_TEMP/sample-fixture/jadx-file-list.txt"
+          grep -R -q 'Sample fixture' "$RUNNER_TEMP/sample-fixture/jadx" || grep -R -q 'com.example.fixture' "$RUNNER_TEMP/sample-fixture/jadx"
+
+      - name: Create compact validation report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports/pipeline
+          APK="$RUNNER_TEMP/sample-fixture/sample-fixture.apk"
+          HASH="$(sha256sum "$APK" | awk '{print $1}')"
+          SIZE="$(stat -c '%s' "$APK")"
+          APKTOOL_VERSION="$(java -jar "$APKTOOL_JAR" --version)"
+          JADX_VERSION="$("$JADX_BIN" --version 2>&1 | tail -n1)"
+          {
+            echo "# Sample APK pipeline validation"
+            echo
+            echo "- Result: PASS (all commands and assertions completed)"
+            echo "- Input: generated synthetic fixture; not the user's AlReader X APK"
+            echo "- Size: $SIZE bytes"
+            echo "- SHA-256: $HASH"
+            echo "- Apktool: $APKTOOL_VERSION"
+            echo "- JADX: $JADX_VERSION"
+            echo "- Apktool decode: passed; decoded manifest exists"
+            echo "- JADX decompile: passed; fixture marker found"
+            echo "- Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- Commit: $GITHUB_SHA"
+            echo
+            echo "This validates only the synthetic fixture pipeline. It does not mean the original AlReader X APK was accessed or modified."
+            echo
+            echo "## Apktool decoded files"
+            cat "$RUNNER_TEMP/sample-fixture/apktool-file-list.txt"
+            echo
+            echo "## JADX output files"
+            cat "$RUNNER_TEMP/sample-fixture/jadx-file-list.txt"
+          } > reports/pipeline/sample-apk-validation.md
+
+      - name: Persist report to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/pipeline/sample-apk-validation.md
+          if git diff --cached --quiet; then
+            echo "Report unchanged; no commit needed."
+          else
+            git commit -m "test: record sample APK pipeline validation"
+            git push origin "HEAD:main"
+          fi
