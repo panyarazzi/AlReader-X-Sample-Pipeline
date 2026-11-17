@@ -1,0 +1,195 @@
+name: Private EPUB CSS and rendering source trace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-epub-css-source-trace
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out public pipeline repository
+        uses: actions/checkout@v5
+
+      - name: Check out private APK and prior trace
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: analysis/epub-trace-44080555175
+          token: \${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+            reports/private-epub-traces/trace-44080555175.md
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify private inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          TRACE="_private-source/reports/private-epub-traces/trace-44080555175.md"
+          test -s "$APK" && test -s "$TRACE"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK integrity: PASS"
+          echo "Prior private trace: PRESENT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download analysis tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-trace"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/apktool-release.json"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
+          [[ "$APKTOOL_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$APKTOOL_URL" -o "$WORK/apktool.jar"
+          curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$WORK/jadx-release.json"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+[.]zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
+          [[ "$JADX_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$JADX_URL" -o "$WORK/jadx.zip"
+          mkdir -p "$WORK/jadx"
+          unzip -q "$WORK/jadx.zip" -d "$WORK/jadx"
+          JADX_BIN="$(find "$WORK/jadx" -type f -path '*/bin/jadx' | head -n1)"
+          test -n "$JADX_BIN"
+          chmod +x "$JADX_BIN"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+
+      - name: Decode and decompile privately
+        shell: bash
+        run: |
+          set -uo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-trace"
+          java -jar "$APKTOOL_JAR" d -f "_private-source/AlReaderX E-Ink-1.33.apk" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          set +e
+          "$JADX_BIN" --show-bad-code --output-dir "$WORK/jadx-out" "_private-source/AlReaderX E-Ink-1.33.apk" > "$WORK/jadx.log" 2>&1
+          JADX_EXIT=$?
+          set -e
+          FILE_COUNT="$(find "$WORK/jadx-out" -type f 2>/dev/null | wc -l | tr -d ' ')"
+          ERROR_COUNT="$(grep -E 'finished with errors, count:' "$WORK/jadx.log" | tail -n1 | sed 's/.*count: //' || true)"
+          test "$FILE_COUNT" -gt 0
+          if [[ "$JADX_EXIT" -eq 0 ]]; then RESULT=PASS
+          elif [[ "$JADX_EXIT" -eq 3 ]]; then RESULT=PARTIAL
+          else echo "Unexpected JADX exit: $JADX_EXIT"; exit "$JADX_EXIT"; fi
+          echo "JADX_RESULT=$RESULT" >> "$GITHUB_ENV"
+          echo "JADX_FILES=$FILE_COUNT" >> "$GITHUB_ENV"
+          echo "JADX_ERRORS=\${ERROR_COUNT:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Extract bounded private source contexts
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-trace"
+          REPORT="_private-source/reports/private-epub-traces/css-source-\${GITHUB_RUN_ID}.md"
+          mkdir -p "$(dirname "$REPORT")"
+          python3 - "$WORK/jadx-out" "$REPORT" <<'PY'
+          import os, sys, re
+          src, report = sys.argv[1:]
+          targets = {
+            'CSS parser and default EPUB rules': ('com/neverland/engbook/allstyles/AlCSSHtml.java', r'DEFAULT_CSS_EPUB|CSSHTML_SET|add_TAG|add_CLASS|add_TAGCLASS|alCSSControl|css_value|parse\\('),
+            'EPUB format and stylesheet references': ('com/neverland/engbook/level2/AlFormatEPUB.java', r'AlFormatBaseHTML|AlCSSHtml|stylesheet|text/css|formatOptionWorked|CSSHTML_SET|addFiles2Read'),
+            'EPUB scan initialization': ('com/neverland/engbook/level2/AlScanEPUB.java', r'AlFormatEPUB|AlCSSHtml|CSSHTML_SET|init\\(|formatOptionWorked'),
+            'EPUB preference fields and CSS generation': ('com/neverland/prefs/TBookCSS.java', r'cssEPUB|font-family|font-size|text-align|text-indent|line-height|append\\('),
+            'Engine EPUB CSS options': ('com/neverland/engbook/forpublic/AlEngineOptions.java', r'BOOKOPT_CSS_EPUB_SHIFT|defaultEPUB0|CSS_EPUB'),
+            'Book engine EPUB initialization': ('com/neverland/engbook/bookobj/AlBookEng.java', r'defaultEPUB0|DEFAULT_CSS_EPUB|AlFormatEPUB|BOOKOPT_CSS_EPUB_SHIFT'),
+            'EPUB settings UI': ('com/neverland/viscomp/dialogs/settings/ListSettingsBaseType.java', r'setting_bookstyles_epub|books_epub_css_|options_short'),
+            'EPUB settings application': ('com/neverland/viscomp/dialogs/settings/TBaseSettingDialog.java', r'books_epub_css_|cssEPUB|setting_bookstyles_epub'),
+          }
+          files={}
+          for base,_,names in os.walk(src):
+            for n in names:
+              if n.endswith('.java'):
+                rel=os.path.relpath(os.path.join(base,n),src).replace(os.sep,'/')
+                files[rel]=os.path.join(base,n)
+          contexts=0
+          with open(report,'w',encoding='utf-8') as out:
+            out.write('# Private EPUB CSS/rendering source-context trace\\n\\n')
+            out.write('Bounded JADX excerpts; this report is stored only in the private repository.\\n\\n')
+            out.write(f"- JADX: {os.environ.get('JADX_RESULT')} ({os.environ.get('JADX_FILES')} generated files; {os.environ.get('JADX_ERRORS')} reported errors)\\n")
+            out.write('- Original APK integrity was verified before analysis.\\n')
+            out.write('- Excerpts are decompiler output; JADX reported partial errors in the previous run.\\n\\n')
+            for label,(suffix,expr) in targets.items():
+              candidates=[(p,f) for p,f in files.items() if p.endswith(suffix)]
+              out.write('## '+label+'\\n\\n')
+              if not candidates:
+                out.write('Target file not found in JADX output.\\n\\n')
+                continue
+              rel,path=candidates[0]
+              with open(path,encoding='utf-8',errors='replace') as f: lines=f.readlines()
+              pat=re.compile(expr,re.I)
+              hits=[i for i,line in enumerate(lines) if pat.search(line)]
+              windows=[]
+              for i in hits:
+                a=max(0,i-8); b=min(len(lines),i+9)
+                if windows and a <= windows[-1][1]+2:
+                  windows[-1]=(windows[-1][0],max(windows[-1][1],b))
+                else: windows.append((a,b))
+              windows=windows[:30]
+              out.write(f'### {rel}: {len(lines)} lines; {len(hits)} matching lines; {len(windows)} contexts\\n\\n')
+              for a,b in windows:
+                contexts+=1
+                out.write(f'Context lines {a+1}-{b}:\\n')
+                for j in range(a,b): out.write(f'{j+1}: {lines[j].rstrip()}\\n')
+                out.write('\\n')
+            out.write('## Interpretation limits\\n\\n')
+            out.write('- Matching text does not prove runtime execution or call order.\\n')
+            out.write('- JADX may misrepresent control flow or omit code because decompilation is partial.\\n')
+            out.write('- Do not patch until CSS loading, cascade/override order, and rendering path are cross-checked.\\n')
+          print(f'Private source-context report created; contexts={contexts}.')
+          PY
+
+      - name: Commit report to a new private branch
+        shell: bash
+        env:
+          PRIVATE_REPORT_WRITE_TOKEN: \${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd _private-source
+          BRANCH="analysis/epub-css-source-\${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add "reports/private-epub-traces/css-source-\${GITHUB_RUN_ID}.md"
+          git commit -m "Add private EPUB CSS source-context trace"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$BRANCH"
+          echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Publish sanitized summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Private EPUB CSS/source trace"
+            echo
+            echo "- Original APK checked out privately and verified."
+            echo "- Detailed decompiler excerpts are stored only in the private source repository."
+            echo "- No source excerpts, identifiers, class names, paths, APK bytes, or decoded resources are published here."
+            echo "- JADX: \${JADX_RESULT:-not completed}; generated files: \${JADX_FILES:-unknown}; errors: \${JADX_ERRORS:-unknown}."
+            echo "- Private report branch: \${PRIVATE_REPORT_BRANCH:-not created}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-epub-css-trace"
