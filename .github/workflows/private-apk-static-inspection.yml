@@ -1,0 +1,166 @@
+name: Private APK static inspection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-apk-static-inspection
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out public pipeline repository
+        uses: actions/checkout@v4
+
+      - name: Check out only the original APK from the private repository
+        uses: actions/checkout@v4
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: main
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify original APK integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK integrity: PASS"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download analysis tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-apk-inspection"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/apktool-release.json"
+          APKTOOL_URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url' "$WORK/apktool-release.json" | head -n1)"
+          [[ "$APKTOOL_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$APKTOOL_URL" -o "$WORK/apktool.jar"
+          curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest -o "$WORK/jadx-release.json"
+          JADX_URL="$(jq -r '.assets[] | select(.name | test("^jadx-[0-9.]+\\.zip$")) | .browser_download_url' "$WORK/jadx-release.json" | head -n1)"
+          [[ "$JADX_URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$JADX_URL" -o "$WORK/jadx.zip"
+          mkdir -p "$WORK/jadx"
+          unzip -q "$WORK/jadx.zip" -d "$WORK/jadx"
+          JADX_BIN="$(find "$WORK/jadx" -type f -path '*/bin/jadx' | head -n1)"
+          test -n "$JADX_BIN"
+          chmod +x "$JADX_BIN"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+
+      - name: Decode and decompile into temporary storage
+        shell: bash
+        run: |
+          set -uo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          WORK="$RUNNER_TEMP/private-apk-inspection"
+          java -jar "$APKTOOL_JAR" d -f "$APK" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          set +e
+          "$JADX_BIN" --show-bad-code --output-dir "$WORK/jadx-out" "$APK" > "$WORK/jadx.log" 2>&1
+          JADX_EXIT=$?
+          set -e
+          FILE_COUNT="$(find "$WORK/jadx-out" -type f 2>/dev/null | wc -l | tr -d ' ')"
+          ERROR_COUNT="$(grep -E 'finished with errors, count:' "$WORK/jadx.log" | tail -n1 | sed 's/.*count: //' || true)"
+          if [[ "$FILE_COUNT" -eq 0 ]]; then
+            echo "JADX generated no source output"
+            exit 1
+          fi
+          if [[ "$JADX_EXIT" -eq 0 ]]; then
+            echo "JADX_RESULT=PASS" >> "$GITHUB_ENV"
+          elif [[ "$JADX_EXIT" -eq 3 ]]; then
+            echo "JADX_RESULT=PARTIAL" >> "$GITHUB_ENV"
+          else
+            echo "JADX failed with unexpected exit code $JADX_EXIT"
+            exit "$JADX_EXIT"
+          fi
+          echo "JADX_FILES=$FILE_COUNT" >> "$GITHUB_ENV"
+          echo "JADX_ERRORS=${ERROR_COUNT:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Extract aggregate technical indicators only
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          WORK="$RUNNER_TEMP/private-apk-inspection"
+          python3 - "$APK" "$WORK/decoded/AndroidManifest.xml" "$WORK/jadx-out" <<'PY'
+          import sys, zipfile, xml.etree.ElementTree as ET
+          apk, manifest_path, source_dir = sys.argv[1:]
+          ns = {'a': 'http://schemas.android.com/apk/res/android'}
+          root = ET.parse(manifest_path).getroot()
+          app = root.find('application')
+          permissions = len(root.findall('uses-permission')) + len(root.findall('uses-permission-sdk-23'))
+          components = 0 if app is None else sum(len(app.findall(x)) for x in ('activity','activity-alias','service','receiver','provider'))
+          min_sdk = root.find('uses-sdk')
+          min_sdk_value = 'not-declared' if min_sdk is None else min_sdk.get('{%s}minSdkVersion' % ns['a'], 'not-declared')
+          target_sdk_value = 'not-declared' if min_sdk is None else min_sdk.get('{%s}targetSdkVersion' % ns['a'], 'not-declared')
+          with zipfile.ZipFile(apk) as z:
+              names = z.namelist()
+              dex_count = sum(1 for n in names if n.endswith('.dex') and '/' not in n)
+              resource_entries = sum(1 for n in names if n.startswith('res/'))
+              asset_entries = sum(1 for n in names if n.startswith('assets/'))
+          import os
+          terms = {
+              'Android WebView API references': ('android.webkit.WebView', 'WebSettings'),
+              'EPUB-related references': ('epub', 'application/epub+zip'),
+              'HTML parsing/rendering references': ('Html.fromHtml', 'loadDataWithBaseURL', 'text/html'),
+              'CSS-related references': ('text/css', '.css'),
+              'font-loading/typeface references': ('Typeface', 'AssetManager', '.ttf', '.otf', '.woff'),
+          }
+          files = []
+          for base, _, fs in os.walk(source_dir):
+              for f in fs:
+                  if f.endswith(('.java','.kt','.xml','.smali')):
+                      files.append(os.path.join(base,f))
+          hits = {}
+          for label, needles in terms.items():
+              count = 0
+              for path in files:
+                  try:
+                      data = open(path, encoding='utf-8', errors='ignore').read()
+                  except OSError:
+                      continue
+                  if any(n.lower() in data.lower() for n in needles):
+                      count += 1
+              hits[label] = count
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as out:
+              out.write('## Private APK static inspection (aggregate-only)\\n\\n')
+              out.write('- Original APK Git blob integrity: **PASS**.\\n')
+              out.write(f'- Minimum SDK declared: **{min_sdk_value}**; target SDK declared: **{target_sdk_value}**.\\n')
+              out.write(f'- DEX files: **{dex_count}**; manifest permissions: **{permissions}**; application components: **{components}**.\\n')
+              out.write(f'- APK resource entries: **{resource_entries}**; asset entries: **{asset_entries}**.\\n')
+              out.write(f'- JADX result: **{os.environ.get("JADX_RESULT","UNKNOWN")}**; generated files: **{os.environ.get("JADX_FILES","0")}**; reported errors: **{os.environ.get("JADX_ERRORS","unknown")}**.\\n\\n')
+              out.write('### Decompiled-source indicator counts\\n\\n')
+              for label, count in hits.items():
+                  out.write(f'- {label}: **{count} files with at least one indicator**.\\n')
+              out.write('\\nCounts are search indicators, not proof that a feature is active or that a specific rendering path is used. No class names, source excerpts, strings, resources, APK bytes, or decompiled files are published.\\n')
+          PY
+
+      - name: Remove temporary private source and analysis files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-apk-inspection"
