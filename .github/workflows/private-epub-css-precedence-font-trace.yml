@@ -1,0 +1,207 @@
+name: Private EPUB CSS precedence and font trace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-epub-css-precedence-font-trace
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated public pipeline
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Checkout original APK privately
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: analysis/epub-css-cascade-44107513195
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-source
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify original APK integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-source/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+          EXPECTED="$(git -C _private-source rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK integrity: PASS"
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Download Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-precedence"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/release.json"
+          URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/release.json" | head -n1)"
+          [[ "$URL" =~ ^https://github\.com/ ]]
+          curl -fsSL "$URL" -o "$WORK/apktool.jar"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+      - name: Decode APK privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-precedence"
+          java -jar "$APKTOOL_JAR" d -f "_private-source/AlReaderX E-Ink-1.33.apk" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          echo "Smali decode: PASS"
+      - name: Trace CSS precedence, parser flags and font property path
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/private-epub-css-precedence"
+          REPORT="_private-source/reports/private-epub-traces/css-precedence-font-$GITHUB_RUN_ID.md"
+          mkdir -p "$(dirname "$REPORT")"
+          python3 - "$WORK/decoded" "$REPORT" <<'PY'
+          import os,sys,re
+          root,report=sys.argv[1:3]
+          files={}
+          for base,_,names in os.walk(root):
+              for name in names:
+                  if name.endswith(".smali"):
+                      p=os.path.join(base,name)
+                      rel=os.path.relpath(p,root).replace(os.sep,"/")
+                      try:
+                          with open(p,encoding="utf-8",errors="replace") as f: files[rel]=f.readlines()
+                      except OSError: pass
+          headers={}
+          for path,lines in files.items():
+              cls=next((m.group(1) for x in lines if (m:=re.search(r"^\.class\s+.*?(L[^;]+;)",x))),None)
+              sup=next((m.group(1) for x in lines if (m:=re.search(r"^\.super\s+(L[^;]+;)",x))),None)
+              if cls: headers[cls]=(path,sup)
+          def iter_methods(lines):
+              i=0
+              while i<len(lines):
+                  if lines[i].startswith(".method "):
+                      s=i
+                      while i<len(lines) and not lines[i].startswith(".end method"): i+=1
+                      yield s,min(i+1,len(lines)),"".join(lines[s:min(i+1,len(lines))])
+                  i+=1
+          def method_name(body):
+              m=re.search(r"^\.method\s+.*?\s([^ (]+)",body.splitlines()[0])
+              return m.group(1) if m else ""
+          def emit_class(out,desc,names=None,rx=None,cap=80):
+              if desc not in headers:
+                  out.write("Class not resolved: "+desc+"\n\n"); return
+              path,_=headers[desc]; n=0
+              out.write("### "+path+" — "+desc+"\n\n")
+              for s,e,body in iter_methods(files[path]):
+                  nm=method_name(body)
+                  if names is not None and nm not in names: continue
+                  if rx and not re.search(rx,body.splitlines()[0],re.I): continue
+                  out.write("#### Lines %d-%d — %s\n\n%s\n\n"%(s+1,e,body.splitlines()[0].strip(),body))
+                  n+=1
+                  if n>=cap:
+                      out.write("Method output cap reached.\n\n"); break
+              if not n: out.write("No matching methods in decoded output; partial decode means this is not proof of absence.\n\n")
+          def search_methods(out,rx,cap=120):
+              n=0
+              for path,lines in sorted(files.items()):
+                  for s,e,body in iter_methods(lines):
+                      if re.search(rx,body.splitlines()[0],re.I):
+                          out.write("### %s lines %d-%d — %s\n\n%s\n\n"%(path,s+1,e,body.splitlines()[0].strip(),body))
+                          n+=1
+                          if n>=cap:
+                              out.write("Global method cap reached.\n\n"); return
+              if not n: out.write("No matching method definitions found in decoded output.\n\n")
+          def contexts(out,rx,cap=100,before=6,after=18):
+              n=0
+              for path,lines in sorted(files.items()):
+                  hits=[i for i,x in enumerate(lines) if re.search(rx,x,re.I)]
+                  if not hits: continue
+                  spans=[]
+                  for i in hits:
+                      lo=max(0,i-before); hi=min(len(lines),i+after)
+                      if spans and lo<=spans[-1][1]: spans[-1]=(spans[-1][0],max(spans[-1][1],hi))
+                      else: spans.append((lo,hi))
+                  out.write("### %s (%d matching lines)\n\n"%(path,len(hits)))
+                  for lo,hi in spans:
+                      out.write("#### Lines %d-%d\n\n"%(lo+1,hi))
+                      for j in range(lo,hi): out.write("%d: %s"%(j+1,lines[j]))
+                      out.write("\n"); n+=1
+                      if n>=cap:
+                          out.write("Context cap reached.\n\n"); return
+          class_list=[d for d,(p,s) in headers.items() if re.search(r"(CSS|Style|Font|EPUB|HTML|BookEng)",p,re.I)]
+          with open(report,"w",encoding="utf-8") as out:
+              out.write("# Private EPUB CSS precedence and font trace\n\n")
+              out.write("- Decoded Smali files: %d\n- Original APK integrity checked before decode\n- Static inspection only; no APK modification or runtime behavior claim.\n\n"%len(files))
+              out.write("## 1. Selector weight constants, enums and mappings\n\n")
+              contexts(out,r"WEIGHT_[0-9]+|CSS_TYPE|selector.?weight|specificity|ordinal\(\)|\.enum",75,8,22)
+              out.write("## 2. Selector application and rule merge methods\n\n")
+              for desc in ["Lcom/neverland/engbook/allstyles/AlCSSStyles;","Lcom/neverland/engbook/allstyles/AlSetCSS;","Lcom/neverland/engbook/allstyles/AlOneCSSPair;","Lcom/neverland/engbook/allstyles/AlStyleStack;"]:
+                  emit_class(out,desc,names={"apply1OneClassX","applyValue","applyValue0","acceptValue","mixFrom","parseTemp"},cap=80)
+              emit_class(out,"Lcom/neverland/engbook/allstyles/AlSetCSS;",rx=r"apply_WEIGHT_",cap=40)
+              out.write("## 3. Parser declarations, priority flags and !important\n\n")
+              contexts(out,r"!important|important|parseDeclaration|parseProperty|parseValue|token|priority|importantFlag|important_mask",100,8,22)
+              search_methods(out,r"(parse|read|scan|accept|add).*(CSS|Style|Property)|(CSS|Style|Property).*(parse|read|scan|accept|add)",120)
+              out.write("## 4. EPUB stylesheet loading, imports and Work Set insertion\n\n")
+              contexts(out,r"parseFile|@import|add.*(Set|CSS)|currentSet|allSets|stylesheet|text/css",110,8,22)
+              search_methods(out,r"parseFile|parse.*Import|import.*CSS|add.*Set",100)
+              out.write("## 5. Font property IDs, declaration application and font loading\n\n")
+              contexts(out,r"font-family|font-weight|font-style|font-size|fontFamily|fontWeight|fontStyle|fontSize|loadFont|\.ttf|\.otf|\.woff|\.woff2",120,8,22)
+              search_methods(out,r".*(Font|font).*(load|set|apply|parse|resolve)|(load|set|apply|parse|resolve).*(Font|font)",100)
+              out.write("## 6. Relevant CSS/HTML/EPUB class declarations\n\n")
+              for desc in class_list[:120]:
+                  path,sup=headers[desc]
+                  out.write("- %s — %s; superclass %s\n"%(desc,path,sup or "not declared"))
+              out.write("\n## 7. Interpretation boundaries\n\n")
+              out.write("- String searches for !important are indicators; priority may be represented by flags or masks instead of retained text.\n")
+              out.write("- Selector weight names are not mapped to CSS specificity unless enum/constants and dispatch logic establish that mapping.\n")
+              out.write("- File insertion order is not automatically final cascade order; follow parser insertion, selector grouping and property merge.\n")
+              out.write("- Font declarations and embedded-font loading are distinct paths.\n")
+              out.write("- Missing matches in partial decode do not prove absence.\n")
+          print("Private precedence/font report created.")
+          PY
+      - name: Commit detailed report to private branch
+        shell: bash
+        env:
+          PRIVATE_REPORT_WRITE_TOKEN: ${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd _private-source
+          BRANCH="analysis/epub-css-precedence-font-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add --sparse "reports/private-epub-traces/css-precedence-font-$GITHUB_RUN_ID.md"
+          git commit -m "Add private EPUB CSS precedence and font trace"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$BRANCH"
+          echo "PRIVATE_REPORT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+      - name: Publish sanitized public summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Private EPUB CSS precedence and font trace"
+            echo
+            echo "- Original APK integrity was checked before private decoding."
+            echo "- Detailed Smali method bodies are stored only in the private source repository."
+            echo "- No APK, decompiled source, class names, private paths or excerpts are published here."
+            echo "- Private report branch: ${PRIVATE_REPORT_BRANCH:-not created}."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-source
+          rm -rf "$RUNNER_TEMP/private-epub-css-precedence"
