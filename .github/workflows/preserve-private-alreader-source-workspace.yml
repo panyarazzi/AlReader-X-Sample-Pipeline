@@ -85,7 +85,7 @@ jobs:
           WORK="$RUNNER_TEMP/alreader-source-workspace"
           DECODED="$WORK/decoded"
           python3 - "$DECODED" "_private-workspace" "$APK_BLOB" "$GITHUB_RUN_ID" <<'PY'
-          import os, sys, shutil, hashlib
+          import os, sys, shutil
           src, dst, apk_blob, run_id = sys.argv[1:5]
           copied = []
           for name in sorted(os.listdir(src)):
@@ -154,7 +154,9 @@ jobs:
           cd _private-workspace
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          # The checkout is sparse to avoid downloading the APK twice. The decoded
+          # tree is intentionally added outside those sparse paths, so use --sparse.
+          git add --sparse -A
           if git diff --cached --quiet; then
             echo "No source workspace changes to commit."
             exit 0
