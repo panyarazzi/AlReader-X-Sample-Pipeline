@@ -33,7 +33,7 @@ jobs:
             indexes
             epub-engine
             reports
-          sparse-checkout-cone-mode: true
+          sparse-checkout-cone-mode: false
           fetch-depth: 1
           persist-credentials: false
 
