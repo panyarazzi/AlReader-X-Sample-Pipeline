@@ -1,0 +1,183 @@
+name: Preserve private AlReader X decompiled workspace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preserve-private-alreader-source-workspace
+  cancel-in-progress: false
+
+jobs:
+  decode-and-preserve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated public pipeline
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout private APK and workspace branch
+        uses: actions/checkout@v5
+        with:
+          repository: panyarazzi/AlReader-X-APK-Transfer
+          ref: analysis/epub-source-workspace
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: _private-workspace
+          sparse-checkout: |
+            AlReaderX E-Ink-1.33.apk
+            README.md
+            indexes
+            epub-engine
+            reports
+          sparse-checkout-cone-mode: true
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify original APK blob integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="_private-workspace/AlReaderX E-Ink-1.33.apk"
+          test -s "$APK"
+          EXPECTED="$(git -C _private-workspace rev-parse "HEAD:AlReaderX E-Ink-1.33.apk")"
+          ACTUAL="$(git hash-object "$APK")"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Original APK blob integrity: PASS"
+          echo "APK_BLOB=$ACTUAL" >> "$GITHUB_ENV"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/alreader-source-workspace"
+          mkdir -p "$WORK"
+          curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest -o "$WORK/release.json"
+          URL="$(jq -r '.assets[] | select(.name | test("^apktool_[0-9.]+[.]jar$")) | .browser_download_url' "$WORK/release.json" | head -n1)"
+          [[ "$URL" =~ ^https://github\.com/ ]]
+          test -n "$URL"
+          curl -fsSL "$URL" -o "$WORK/apktool.jar"
+          echo "APKTOOL_JAR=$WORK/apktool.jar" >> "$GITHUB_ENV"
+
+      - name: Decode APK once with Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/alreader-source-workspace"
+          java -jar "$APKTOOL_JAR" d -f "_private-workspace/AlReaderX E-Ink-1.33.apk" -o "$WORK/decoded" > "$WORK/apktool.log" 2>&1
+          test -s "$WORK/decoded/AndroidManifest.xml"
+          test -d "$WORK/decoded/smali"
+          echo "Apktool decode: PASS"
+
+      - name: Preserve complete decoded project privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/alreader-source-workspace"
+          DECODED="$WORK/decoded"
+          python3 - "$DECODED" "_private-workspace" "$APK_BLOB" "$GITHUB_RUN_ID" <<'PY'
+          import os, sys, shutil, hashlib
+          src, dst, apk_blob, run_id = sys.argv[1:5]
+          copied = []
+          for name in sorted(os.listdir(src)):
+              s = os.path.join(src, name)
+              d = os.path.join(dst, name)
+              if os.path.isdir(s):
+                  if os.path.exists(d):
+                      shutil.rmtree(d)
+                  shutil.copytree(s, d)
+              else:
+                  shutil.copy2(s, d)
+              copied.append(name)
+          index_dir = os.path.join(dst, "indexes")
+          os.makedirs(index_dir, exist_ok=True)
+          counts = {}
+          total_bytes = 0
+          native = []
+          smali_files = []
+          for base, dirs, files in os.walk(dst):
+              dirs[:] = [x for x in dirs if x not in {".git"}]
+              for filename in files:
+                  path = os.path.join(base, filename)
+                  rel = os.path.relpath(path, dst).replace(os.sep, "/")
+                  try:
+                      size = os.path.getsize(path)
+                  except OSError:
+                      size = 0
+                  total_bytes += size
+                  ext = os.path.splitext(filename)[1].lower() or "[no extension]"
+                  counts[ext] = counts.get(ext, 0) + 1
+                  if filename.endswith(".smali"):
+                      smali_files.append(rel)
+                  if filename.endswith(".so"):
+                      native.append((rel, size))
+          with open(os.path.join(index_dir, "decompiled-tree-inventory.md"), "w", encoding="utf-8") as f:
+              f.write("# Decompiled APK tree inventory\n\n")
+              f.write(f"- Source APK Git blob: `{apk_blob}`\n")
+              f.write(f"- Source workflow run: `{run_id}`\n")
+              f.write("- Decoder: Apktool; no JADX pass in this preservation workflow.\n")
+              f.write("- Static reverse-engineering workspace only; this is not original source code or a guaranteed buildable Android project.\n")
+              f.write("- APK itself was not modified.\n\n")
+              f.write("## Preserved top-level entries\n\n")
+              for name in copied:
+                  f.write(f"- `{name}/`\n" if os.path.isdir(os.path.join(dst, name)) else f"- `{name}`\n")
+              f.write("\n## File counts by extension\n\n")
+              for ext, count in sorted(counts.items()):
+                  f.write(f"- `{ext}`: {count}\n")
+              f.write(f"\n## Smali inventory\n\n- Total Smali files: {len(smali_files)}\n")
+              f.write("- Original Apktool paths are preserved, including `smali_classesN` directories.\n")
+              f.write("\n## Native library inventory\n\n")
+              if native:
+                  for path, size in native:
+                      f.write(f"- `{path}` ({size} bytes)\n")
+              else:
+                  f.write("- No `.so` files found in the decoded tree.\n")
+              f.write(f"\n## Total workspace size\n\n- {total_bytes} bytes (including existing private workspace files).\n")
+          print(f"Preserved {len(copied)} decoded top-level entries; {len(smali_files)} Smali files.")
+          PY
+
+      - name: Commit decoded source tree to private workspace branch
+        shell: bash
+        env:
+          PRIVATE_REPORT_WRITE_TOKEN: ${{ secrets.PRIVATE_REPORT_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd _private-workspace
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No source workspace changes to commit."
+            exit 0
+          fi
+          git commit -m "Preserve complete Apktool decompiled source workspace"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PRIVATE_REPORT_WRITE_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/analysis/epub-source-workspace"
+
+      - name: Publish sanitized summary only
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Private AlReader X source workspace"
+            echo
+            echo "- Original APK integrity is checked before decoding."
+            echo "- Decompiled output is pushed only to the private APK repository."
+            echo "- No APK, Smali, resources, asset contents or private paths are published here."
+            echo "- The preserved tree is Apktool output, not original source code."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup private source and decoded output
+        if: always()
+        shell: bash
+        run: |
+          rm -rf _private-workspace
+          rm -rf "$RUNNER_TEMP/alreader-source-workspace"
